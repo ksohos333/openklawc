@@ -1,0 +1,25 @@
+# Project-local openklawc config.
+# This is merged on top of ~/.config/openklawc/config.toml
+
+model = "ollama/qwen3"
+
+[provider.ollama]
+base_url = "http://localhost:11434/v1"
+api_key = ""
+models = ["qwen3"]
+
+# Rust-native MCP servers (built into this workspace)
+[mcp.web_research]
+command = "./target/release/mcp-web-research"
+args = []
+
+[mcp.anticonf]
+command = "./target/release/mcp-anticonf"
+args = []
+
+[mcp.legal_research]
+command = "./target/release/mcp-legal-research"
+args = []
+
+[autonomy]
+default_level = "yolo"

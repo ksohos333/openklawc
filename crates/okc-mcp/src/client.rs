@@ -41,7 +41,7 @@ struct JsonRpcError {
     message: String,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct McpTool {
     pub name: String,
     #[serde(default)]

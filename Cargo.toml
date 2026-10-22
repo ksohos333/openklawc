@@ -11,6 +11,9 @@ members = [
     "crates/okc-rag",
     "crates/okc-git",
     "crates/okc-plugin",
+    "crates/mcp-web-research",
+    "crates/mcp-anticonf",
+    "crates/mcp-legal-research",
     "crates/openklawc",
 ]
 resolver = "2"
