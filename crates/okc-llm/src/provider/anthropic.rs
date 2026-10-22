@@ -2,10 +2,11 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::Sender;
+use serde_json::Value;
 
-use okc_core::{ChatMessage, LlmProvider, Role, StreamTx};
+use okc_core::{ChatMessage, LlmProvider, NativeToolDef, NativeToolResult, Role, StreamTx, TurnOutput};
 
+use crate::native_tools::{parse_anthropic_content, to_anthropic_tool_result, to_anthropic_tool_results, to_anthropic_tools};
 use crate::streaming::{into_sse_stream, SseEvent};
 
 pub struct AnthropicProvider {
@@ -22,6 +23,17 @@ impl AnthropicProvider {
             api_key: api_key.to_string(),
         }
     }
+
+    fn build_headers(&self) -> Result<HeaderMap> {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(
+            "x-api-key",
+            HeaderValue::from_str(&self.api_key).context("bad api key")?,
+        );
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        Ok(headers)
+    }
 }
 
 #[async_trait]
@@ -34,6 +46,10 @@ impl LlmProvider for AnthropicProvider {
         true
     }
 
+    fn supports_native_tools(&self) -> bool {
+        true
+    }
+
     async fn chat(&self, model: &str, messages: Vec<ChatMessage>) -> Result<String> {
         let (system, user_messages) = extract_system(messages);
         let req = AnthropicRequest {
@@ -42,23 +58,13 @@ impl LlmProvider for AnthropicProvider {
             system,
             messages: user_messages,
             stream: false,
+            tools: None,
         };
         let url = format!("{}/messages", self.base_url);
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(
-            "x-api-key",
-            HeaderValue::from_str(&self.api_key).context("bad api key")?,
-        );
-        headers.insert(
-            "anthropic-version",
-            HeaderValue::from_static("2023-06-01"),
-        );
-
         let resp = self
             .client
             .post(&url)
-            .headers(headers)
+            .headers(self.build_headers()?)
             .json(&req)
             .send()
             .await
@@ -73,8 +79,10 @@ impl LlmProvider for AnthropicProvider {
         let body: AnthropicResponse = resp.json().await.context("parsing response")?;
         let text = body
             .content
-            .into_iter()
-            .filter_map(|b| b.text)
+            .iter()
+            .filter_map(|b| {
+                b.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+            })
             .collect::<String>();
         Ok(text)
     }
@@ -92,23 +100,71 @@ impl LlmProvider for AnthropicProvider {
             system,
             messages: user_messages,
             stream: true,
+            tools: None,
+        };
+        self.do_stream(req, tx).await
+    }
+
+    // ─── Native tools ───────────────────────────────────────────────────────
+
+    async fn chat_with_tools(
+        &self,
+        model: &str,
+        messages: Vec<ChatMessage>,
+        tools: Vec<NativeToolDef>,
+    ) -> Result<TurnOutput> {
+        let (system, user_messages) = extract_system(messages);
+        let req = AnthropicRequest {
+            model: model.to_string(),
+            max_tokens: 8192,
+            system,
+            messages: user_messages,
+            stream: false,
+            tools: Some(to_anthropic_tools(&tools)),
         };
         let url = format!("{}/messages", self.base_url);
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(
-            "x-api-key",
-            HeaderValue::from_str(&self.api_key).context("bad api key")?,
-        );
-        headers.insert(
-            "anthropic-version",
-            HeaderValue::from_static("2023-06-01"),
-        );
-
         let resp = self
             .client
             .post(&url)
-            .headers(headers)
+            .headers(self.build_headers()?)
+            .json(&req)
+            .send()
+            .await
+            .with_context(|| format!("POST {}", url))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("{} from {}: {}", status, url, text);
+        }
+
+        let body: AnthropicResponse = resp.json().await.context("parsing response")?;
+        Ok(parse_anthropic_content(&body.content))
+    }
+
+    async fn chat_stream_with_tools(
+        &self,
+        model: &str,
+        messages: Vec<ChatMessage>,
+        tools: Vec<NativeToolDef>,
+        tx: StreamTx,
+    ) -> Result<TurnOutput> {
+        // Anthropic tool streaming is complex (content_block events).
+        // For now, fall back to non-streaming for tool calls.
+        let result = self.chat_with_tools(model, messages, tools).await?;
+        // Still send text chunks to the UI
+        let _ = tx.send(result.text.clone()).await;
+        Ok(result)
+    }
+}
+
+impl AnthropicProvider {
+    async fn do_stream(&self, req: AnthropicRequest, tx: StreamTx) -> Result<()> {
+        let url = format!("{}/messages", self.base_url);
+        let resp = self
+            .client
+            .post(&url)
+            .headers(self.build_headers()?)
             .json(&req)
             .send()
             .await
@@ -142,22 +198,36 @@ fn extract_system(messages: Vec<ChatMessage>) -> (Option<String>, Vec<AnthropicM
         .iter()
         .find(|m| m.role == Role::System)
         .map(|m| m.content.clone());
+
     let msgs: Vec<_> = messages
         .iter()
         .filter(|m| m.role != Role::System)
-        .map(|m| AnthropicMessage {
-            role: if m.role == Role::Assistant {
+        .map(|m| {
+            let role = if m.role == Role::Assistant {
                 "assistant".to_string()
             } else {
                 "user".to_string()
-            },
-            content: m.content.clone(),
+            };
+
+            // Detect if content is already a JSON array of content blocks
+            // (e.g., tool_result blocks injected by the orchestrator)
+            let content = if m.content.trim().starts_with('[') {
+                serde_json::from_str(&m.content).unwrap_or_else(|_| {
+                    serde_json::json!(m.content)
+                })
+            } else {
+                serde_json::json!(m.content)
+            };
+
+            AnthropicMessage { role, content }
         })
         .collect();
     (sys, msgs)
 }
 
-// ─── Types ───────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
 
 #[derive(Debug, Serialize)]
 struct AnthropicRequest {
@@ -167,24 +237,20 @@ struct AnthropicRequest {
     system: Option<String>,
     messages: Vec<AnthropicMessage>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct AnthropicMessage {
     role: String,
-    content: String,
+    content: Value, // Can be String or array of content blocks
 }
 
 #[derive(Debug, Deserialize)]
 struct AnthropicResponse {
-    content: Vec<AnthropicContentBlock>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AnthropicContentBlock {
-    #[serde(rename = "type")]
-    ty: String,
-    text: Option<String>,
+    #[serde(default)]
+    content: Vec<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -198,8 +264,21 @@ struct AnthropicStreamEvent {
 #[derive(Debug, Deserialize)]
 struct AnthropicDelta {
     #[serde(rename = "type")]
-    ty: String,
+    ty: Option<String>,
     text: Option<String>,
 }
 
 use futures::StreamExt;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PUBLIC: Build tool result messages for Anthropic
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Build an Anthropic user message containing tool_result blocks.
+pub fn build_anthropic_tool_result_message(results: &[NativeToolResult]) -> AnthropicMessage {
+    let blocks = to_anthropic_tool_results(results);
+    AnthropicMessage {
+        role: "user".to_string(),
+        content: serde_json::json!(blocks),
+    }
+}

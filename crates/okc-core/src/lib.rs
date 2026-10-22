@@ -357,6 +357,57 @@ pub struct ModelCapabilities {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// NATIVE TOOL TYPES (Autarky)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// One tool made available to the LLM in our native format.
+/// Providers translate this to their wire format at the boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeToolDef {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema object describing parameters.
+    pub parameters: Value,
+}
+
+/// A tool call emitted by the LLM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeToolCall {
+    /// Provider-generated call ID (must echo back in result).
+    pub id: String,
+    pub name: String,
+    pub arguments: Value,
+}
+
+/// The result of executing one tool call, fed back to the LLM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeToolResult {
+    /// Must match the `id` from the corresponding `NativeToolCall`.
+    pub call_id: String,
+    /// Text content the model will see.
+    pub content: String,
+    /// If true, the model receives this as an error.
+    #[serde(default)]
+    pub is_error: bool,
+}
+
+/// What an LLM turn produces: either text, tool calls, or both.
+#[derive(Debug, Clone, Default)]
+pub struct TurnOutput {
+    pub text: String,
+    pub tool_calls: Vec<NativeToolCall>,
+}
+
+impl TurnOutput {
+    pub fn is_tool_call(&self) -> bool {
+        !self.tool_calls.is_empty()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty() && self.tool_calls.is_empty()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // STREAMING
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -368,13 +419,91 @@ pub type StreamRx = mpsc::Receiver<String>;
 pub trait LlmProvider: Send + Sync {
     fn name(&self) -> &str;
     fn supports_streaming(&self) -> bool;
+
+    /// Basic chat without tools (text-only fallback).
     async fn chat(&self, model: &str, messages: Vec<ChatMessage>) -> anyhow::Result<String>;
+
+    /// Basic streaming chat without tools.
     async fn chat_stream(
         &self,
         model: &str,
         messages: Vec<ChatMessage>,
         tx: StreamTx,
     ) -> anyhow::Result<()>;
+
+    // ─── Native tool calling (optional, default = not supported) ───────────
+
+    fn supports_native_tools(&self) -> bool {
+        false
+    }
+
+    /// Chat with native tool support. Returns TurnOutput (text + tool_calls).
+    /// Default implementation falls back to text injection + text parsing.
+    async fn chat_with_tools(
+        &self,
+        model: &str,
+        messages: Vec<ChatMessage>,
+        tools: Vec<NativeToolDef>,
+    ) -> anyhow::Result<TurnOutput> {
+        let mut msgs = messages;
+        if let Some(sys) = msgs.iter_mut().find(|m| m.role == Role::System) {
+            sys.content = inject_tools_into_prompt(&sys.content, &tools);
+        }
+        let text = self.chat(model, msgs).await?;
+        Ok(parse_tool_calls_native(&text))
+    }
+
+    /// Streaming chat with native tool support.
+    /// Default implementation falls back to text-only stream.
+    async fn chat_stream_with_tools(
+        &self,
+        model: &str,
+        messages: Vec<ChatMessage>,
+        tools: Vec<NativeToolDef>,
+        tx: StreamTx,
+    ) -> anyhow::Result<TurnOutput> {
+        let mut msgs = messages;
+        if let Some(sys) = msgs.iter_mut().find(|m| m.role == Role::System) {
+            sys.content = inject_tools_into_prompt(&sys.content, &tools);
+        }
+        self.chat_stream(model, msgs, tx).await?;
+        // Streaming doesn't return TurnOutput directly; caller must re-parse.
+        // This is the fallback path.
+        Ok(TurnOutput::default())
+    }
+}
+
+fn inject_tools_into_prompt(base: &str, tools: &[NativeToolDef]) -> String {
+    let mut prompt = base.to_string();
+    if !tools.is_empty() {
+        prompt.push_str("\n\nYou have access to the following tools. ");
+        prompt.push_str("When you need to use a tool, output ONE standalone JSON block per line:\n");
+        prompt.push_str(r#"{"tool": "tool_name", "arguments": {"param": "value"}}"#);
+        prompt.push('\n');
+        prompt.push_str("Do NOT wrap tool calls in markdown code fences.\n\n");
+        prompt.push_str("Available tools:\n");
+        for tool in tools {
+            let schema = serde_json::to_string(&tool.parameters).unwrap_or_default();
+            prompt.push_str(&format!("\n### {}\n{}", tool.name, tool.description));
+            prompt.push_str(&format!("\n  Parameters: {}\n", schema));
+        }
+    }
+    prompt
+}
+
+pub fn parse_tool_calls_native(text: &str) -> TurnOutput {
+    let (clean_text, calls) = parse_tool_calls(text);
+    TurnOutput {
+        text: clean_text,
+        tool_calls: calls
+            .into_iter()
+            .map(|tc| NativeToolCall {
+                id: tc.id.to_string(),
+                name: tc.name,
+                arguments: tc.arguments,
+            })
+            .collect(),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

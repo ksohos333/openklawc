@@ -5,6 +5,7 @@
 //!   - Anthropic Claude
 //!   - Ollama (local)
 
+pub mod native_tools;
 pub mod provider;
 pub mod streaming;
 
