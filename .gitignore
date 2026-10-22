@@ -1,0 +1,17 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Local config (each user has their own)
+/config.local.toml
+/.openklawc.local
+
+# Editor / OS noise
+.DS_Store
+.vscode/
+*.swp
+*.swo
+
+# Build output copies (for testing)
+*.test
