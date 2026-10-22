@@ -1,0 +1,20 @@
+[package]
+name = "okc-tui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+okc-core = { workspace = true }
+okc-config = { workspace = true }
+okc-reasoning = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+unicode-width = { workspace = true }
+unicode-segmentation = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+indexmap = { workspace = true }

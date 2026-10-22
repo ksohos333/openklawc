@@ -1,0 +1,32 @@
+[package]
+name = "openklawc"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+default-run = "openklawc"
+
+[[bin]]
+name = "openklawc"
+path = "src/main.rs"
+
+[dependencies]
+okc-core = { workspace = true }
+okc-config = { workspace = true }
+okc-llm = { workspace = true }
+okc-mcp = { workspace = true }
+okc-tool = { workspace = true }
+okc-tui = { workspace = true }
+okc-session = { workspace = true }
+okc-reasoning = { workspace = true }
+okc-rag = { workspace = true }
+okc-git = { workspace = true }
+okc-plugin = { workspace = true }
+
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+crossterm = { workspace = true }
+ratatui = { workspace = true }

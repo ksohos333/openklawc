@@ -1,97 +1,160 @@
-# openklawc
+# openklawc — Autonomous Rust Coding Agent
 
-A personal Rust TUI for an LLM agent. Talks to local MCP servers over stdio JSON-RPC. Slowly morphs toward replacing the TypeScript opencode harness it was inspired by, but starts thin and grows as it's needed.
+A Rust-native TUI coding agent that combines the feature richness of **opencode**, the clean async architecture of **openclaude**, and the autonomous agent loop of **hermes** (Nous Research).
 
-> **Status: v0.1, Phase 1 — hello world.** This repo exists. It renders a TUI. The next phases build chat, MCP client, and per-project auto-loader. See `~/openklawc-design.md` (private notes) for the full spec.
+## Architecture
 
-## What it is
+openklawc is organized as a Cargo workspace with modular crates:
 
-- A `ratatui` TUI in Rust.
-- Spawns Python MCP servers (currently: `web_research`, `anticonf`, `legal_research`) as child processes.
-- Speaks JSON-RPC to them. No cloud, no API keys (for the MCPs themselves — you still need an LLM API key for the agent behind them).
-- One TUI, your keybindings, your theme, your auto-loader rules.
+```
+crates/
+├── openklawc/      # Main binary — event loop, orchestration
+├── okc-core/       # Foundational types: events, messages, tools, reasoning
+├── okc-config/     # Hierarchical config loading (file, env, defaults)
+├── okc-llm/        # Multi-provider LLM abstraction with streaming
+│   ├── OpenAI-compatible (OpenAI, Groq, etc.)
+│   ├── Anthropic Claude
+│   └── Ollama (local)
+├── okc-mcp/        # Model Context Protocol client (stdio + SSE)
+├── okc-tool/       # Built-in tools: shell, file, git, search
+├── okc-reasoning/  # Autonomy engine — plan / observe / execute / reflect
+├── okc-tui/        # ratatui terminal interface
+├── okc-session/    # Session persistence
+├── okc-rag/        # Simple RAG / context indexing
+├── okc-git/        # Git operations
+└── okc-plugin/     # Plugin system (future: WASM/dynamic libs)
+```
 
-## What it is NOT
+## Key Features
 
-- Not a complete agent harness. v0.1 talks to existing MCPs; it doesn't yet have a full agent loop, file context, history, or tool-use routing. Those come in later phases.
-- Not a fork of opencode. It's a separate binary. They can coexist; you choose which to launch.
-- Not a public "platform" or product. It's a personal tool that happens to be open source because that's the right way to ship software.
+### Autonomy Levels
+Control how much the agent can do without asking:
+
+| Level | Behavior |
+|-------|----------|
+| `ask` | Confirm every tool call |
+| `read_only` | Auto-execute reads, confirm mutations |
+| `yolo` | Execute everything, log visibly |
+| `god` | Execute everything silently (not recommended) |
+
+### Visible Reasoning
+Unlike hidden chain-of-thought, openklawc shows its reasoning inline:
+- `[PLAN]` — what it intends to do
+- `[OBS]` — observations from tool results
+- `[EXEC]` — what it's running
+- `[ERR]` — failures and recovery
+
+### Streaming
+Responses stream in real-time from any provider that supports it.
+
+### Multi-Provider LLM
+Configure multiple providers simultaneously. Switch with `/model provider/model_id`.
+
+### MCP Support
+Connect to any MCP server (Python, Node, etc.) over stdio or SSE.
+
+### Built-in Tools
+- `read_file` — Read files with line limits
+- `write_file` — Create or overwrite files
+- `list_dir` — Directory listings
+- `search_files` — Regex search across project
+- `shell` — Shell command execution
+- `git` — Git operations
+- `view_cwd` — Project structure summary
 
 ## Building
 
-You need a Rust toolchain. The project uses `uv` for the Python venvs that back the MCPs, but the Rust side is plain Cargo:
-
 ```bash
-$ uv tool install rust           # if you don't have cargo/rustc yet
-$ cd ~/code/openklawc
-$ cargo build --release
-$ ./target/release/openklawc
-```
-
-To install on `$PATH`:
-
-```bash
-$ cp target/release/openklawc ~/.local/bin/
-$ openklawc
+cd /home/bpoppa12/code/openklawc
+cargo build --release
 ```
 
 ## Configuration
 
-`~/.config/openklawc/config.toml`:
+Config merges in order of priority:
+1. Environment variables (`OKC_*`)
+2. `.openklawc.toml` in current directory
+3. `~/.config/openklawc/config.toml`
+4. Built-in defaults
+
+### Example `~/.config/openklawc/config.toml`
 
 ```toml
+model = "anthropic/claude-3-5-sonnet"
+small_model = "ollama/qwen3"
+
+[provider.anthropic]
+base_url = "https://api.anthropic.com/v1"
+api_key = "sk-ant-..."
+models = ["claude-3-5-sonnet", "claude-3-opus"]
+
+[provider.ollama]
+base_url = "http://localhost:11434"
+api_key = ""
+models = ["qwen3", "llama3.1"]
+
 [mcp.web_research]
-command = "/home/bpoppa12/.local/share/web_research/.venv/bin/python"
-args    = ["/home/bpoppa12/.local/share/web_research/mcp_server.py"]
+command = "python"
+args = ["/path/to/web_research/mcp_server.py"]
 
-[mcp.anticonf]
-command = "/home/bpoppa12/.local/share/anticonf/.venv/bin/python"
-args    = ["/home/bpoppa12/.local/share/anticonf/mcp_server.py"]
+[ui]
+show_reasoning = true
+stream_responses = true
+vim_mode = true
 
-[mcp.legal_research]
-command = "/home/bpoppa12/.local/share/legal_research/.venv/bin/python"
-args    = ["/home/bpoppa12/.local/share/legal_research/mcp_server.py"]
-
-[loader.rules]
-blender   = ["*.blend", "*.blend1"]
-rust      = ["Cargo.toml"]
-node      = ["package.json", "yarn.lock", "pnpm-lock.yaml"]
-python    = ["pyproject.toml", "requirements.txt", "setup.py"]
+[autonomy]
+default_level = "read_only"
+yolo_tools = ["search", "read_file", "list_dir"]
 ```
 
-A starter `config.toml` will be committed in Phase 2 with this content. For now, `cargo run` works without one (no MCPs spawned).
+## Usage
 
-## Keybindings (planned — Phase 1 has only `q` to quit)
+```bash
+# Run with default config
+cargo run
 
-- **Normal mode (vim)**: `i` insert, `:` command, `j`/`k` scroll, `G`/`gg` jump
-- **Insert mode (emacs)**: `Ctrl-a`/`Ctrl-e` line start/end, `Ctrl-k` kill to end, `Enter` submit
-- **Modal (1/2/3)**: yes / no / skip for prompts
-- **Arrow keys** work in both modes
+# In the TUI
+> How do I refactor this module?        # Chat with LLM
+> @src/main.rs what does this do?       # Attach file context
+/models                                  # List available models
+/model anthropic/claude-3-5-sonnet      # Switch model
+/autonomy yolo                           # Enable yolo mode
+/rag how is auth handled?               # Search indexed context
+/rag-index                              # Reindex current directory
+/help                                    # Show all commands
+```
 
-See `~/openklawc-design.md` §4 for the full keymap.
+## Keyboard Shortcuts
 
-## Theme
+### Normal Mode (vim)
+| Key | Action |
+|-----|--------|
+| `i` | Enter insert mode |
+| `/` | Start command |
+| `j` / `k` | Scroll down / up |
+| `q` | Quit |
 
-Black background, single bright gold (`#FFD700`) accent. The "bling" lives in the single highlight, not in decoration everywhere. Easy to swap if you want a different accent — `ui/theme.rs` (added in Phase 2) is the only place to change.
+### Insert Mode (emacs)
+| Key | Action |
+|-----|--------|
+| `Ctrl-a` / `Home` | Start of line |
+| `Ctrl-e` / `End` | End of line |
+| `Ctrl-k` | Kill to end |
+| `Ctrl-u` | Kill to start |
+| `Ctrl-w` | Kill word |
+| `Enter` | Submit |
+| `Esc` | Return to normal |
 
-## Project status
+## Roadmap
 
-- **Phase 1** (this commit): hello world. Single window, gold border, ticking counter, `q` to quit.
-- **Phase 2**: chat input + scrollback with vim/emacs line editing.
-- **Phase 3**: stdio JSON-RPC MCP client, wired to `web_search` first.
-- **Phase 4**: per-project MCP auto-loader. `cd` into a directory with `package.json`, get the prompt to load the right MCPs.
-- **Phase 5**: verify-first status badge (counts of cited vs uncited claims in the anticonf observation log).
-
-6-week realistic plan, each phase a runnable binary. See design doc for full roadmap.
-
-## How this was built
-
-Honest disclosure: parts of this code (including this README and a meaningful share of the design) were generated with AI assistance. The build, debug, integration, and decisions are mine. PRs to clean up, refactor, or rewrite-from-scratch are welcome — `git log` will be honest about what's there.
-
-## Contributing
-
-Issues, PRs, and design feedback are all welcome. If you're submitting a PR, please run `cargo fmt` and `cargo clippy` first. The design doc is the source of truth for what's planned; if you want to build something not in the doc, open an issue first so we can sync.
+- [ ] Tool call parsing from LLM responses (function calling)
+- [ ] Full agent loop with planning/reflection
+- [ ] File mutation diffing and review
+- [ ] CodeMode-like sandboxed execution
+- [ ] Plugin loading (WASM)
+- [ ] Web interface
+- [ ] Desktop app (Tauri)
 
 ## License
 
-MIT. See `LICENSE`.
+MIT
