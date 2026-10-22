@@ -14,8 +14,11 @@ use serde_json::{json, Value};
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
+pub mod composite;
 pub mod fs;
 pub mod shell;
+
+pub use composite::CompositeExecutor;
 
 /// Built-in tool registry.
 pub struct BuiltInTools {

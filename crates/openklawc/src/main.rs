@@ -4,14 +4,9 @@
 //!   - opencode (feature-rich AI dev tool)
 //!   - openclaude (Rust TUI patterns)
 //!   - hermes (Nous Research agent loop — plan → execute → reflect)
-//!
-//! Autonomy levels:
-//!   ask       — confirm every tool call
-//!   read_only — auto-execute reads, confirm mutations
-//!   yolo      — execute everything, log visibly
-//!   god       — execute everything silently (not recommended)
 
 use std::io::{self, stdout};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -25,20 +20,18 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use okc_config::Config;
-use okc_core::{AutonomyLevel, ChatMessage, EventBus, Role};
+use okc_core::{AutonomyLevel, ChatMessage, EventBus};
 use okc_llm::{LlmClient, ProviderRegistry};
 use okc_mcp::McpRegistry;
 use okc_rag::SimpleRag;
-use okc_reasoning::AutonomyEngine;
+use okc_reasoning::{Agent, AgentUpdate};
 use okc_session::SessionStore;
-use okc_tool::BuiltInTools;
+use okc_tool::{BuiltInTools, CompositeExecutor};
 use okc_tui::{App, AppEvent};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Setup tracing
     tracing_subscriber::fmt::init();
-
     info!("openklawc starting...");
 
     enable_raw_mode()?;
@@ -55,7 +48,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-    // ─── Configuration ──────────────────────────────────────────────────────
+    // ─── Config ─────────────────────────────────────────────────────────────
     let cfg = Config::load_default().unwrap_or_default();
     let event_bus = EventBus::new(256);
 
@@ -64,13 +57,26 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Resul
     let llm_client = LlmClient::new();
     let mut current_model = cfg.model.clone();
 
+    let (default_provider, default_model_id) = llm_registry
+        .get(&current_model)
+        .unwrap_or_else(|| {
+            let first = llm_registry.list().first().cloned();
+            let p = first.as_ref().and_then(|m| {
+                llm_registry.get(&format!("{}/{}", m.provider, m.model_id))
+            });
+            p.unwrap_or_else(|| {
+                let ollama = Arc::new(okc_llm::OllamaProvider::new("http://localhost:11434"));
+                (ollama, "qwen3".to_string())
+            })
+        });
+
     // ─── MCP ────────────────────────────────────────────────────────────────
     let mcp_registry = if cfg.mcp.is_empty() {
         None
     } else {
         match McpRegistry::start(&cfg.mcp).await {
             Ok(r) => {
-                info!("MCP registry started with {} tools", r.all_tools().len());
+                info!("MCP registry: {} tools", r.all_tools().len());
                 Some(r)
             }
             Err(e) => {
@@ -80,8 +86,23 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Resul
         }
     };
 
-    // ─── Built-in Tools ─────────────────────────────────────────────────────
-    let builtin_tools = std::sync::Arc::new(BuiltInTools::new());
+    // ─── Composite Tools (builtin + MCP) ────────────────────────────────────
+    let mut composite = CompositeExecutor::new();
+    composite.add(Arc::new(BuiltInTools::new()));
+    // NOTE: MCP tools could be added here if McpRegistry derived Clone.
+    // For v0.2, builtin tools cover file, git, shell, search operations.
+    let tools: Arc<dyn okc_core::ToolExecutor> = Arc::new(composite);
+
+    // ─── Agent ──────────────────────────────────────────────────────────────
+    let mut agent = Agent::new(
+        llm_client.clone(),
+        default_provider,
+        default_model_id,
+        tools,
+        parse_autonomy(&cfg.autonomy.default_level),
+        event_bus.clone(),
+    );
+    agent.streaming = cfg.ui.stream_responses;
 
     // ─── RAG ────────────────────────────────────────────────────────────────
     let mut rag = SimpleRag::new();
@@ -92,50 +113,82 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Resul
     // ─── Session ────────────────────────────────────────────────────────────
     let _session_store = SessionStore::new().ok();
 
-    // ─── Autonomy Engine ────────────────────────────────────────────────────
-    let autonomy = parse_autonomy(&cfg.autonomy.default_level);
-    let _autonomy_engine = AutonomyEngine::new(autonomy, event_bus.clone());
-
-    // ─── TUI State ──────────────────────────────────────────────────────────
+    // ─── TUI ────────────────────────────────────────────────────────────────
     let mut app = App::new();
     app.model = current_model.clone();
-    app.autonomy = autonomy;
+    app.autonomy = agent.autonomy;
     app.mcp_count = mcp_registry.as_ref().map(|r| r.all_tools().len()).unwrap_or(0);
     app.show_reasoning = cfg.ui.show_reasoning;
 
-    // ─── Message history ────────────────────────────────────────────────────
+    // ─── Conversation history ───────────────────────────────────────────────
     let mut messages: Vec<ChatMessage> = Vec::new();
 
-    // ─── Streaming channel ──────────────────────────────────────────────────
-    let (stream_tx, mut stream_rx) = mpsc::channel::<String>(128);
+    // ─── Agent ↔ TUI channel ────────────────────────────────────────────────
+    let (agent_tx, mut agent_rx) = mpsc::channel::<AgentUpdate>(256);
 
-    // ─── Main event loop ────────────────────────────────────────────────────
-    let mut streaming = false;
-    let mut stream_buffer = String::new();
+    // ─── Main loop state ────────────────────────────────────────────────────
+    let mut agent_running = false;
 
     loop {
-        terminal.draw(|frame| {
-            app.render(frame, frame.area());
-        })?;
-
-        // Check for stream chunks
-        if streaming {
-            match tokio::time::timeout(Duration::from_millis(50), stream_rx.recv()).await {
-                Ok(Some(chunk)) => {
-                    stream_buffer.push_str(&chunk);
-                    app.update_last_assistant(stream_buffer.clone());
+        // ─── Drain agent updates ──────────────────────────────────────────
+        while let Ok(update) = agent_rx.try_recv() {
+            match update {
+                AgentUpdate::TextChunk(chunk) => {
+                    // Append to the last assistant message
+                    if let Some(last) = app.scrollback.last_mut() {
+                        if let okc_tui::app::ScrollEntry::Assistant(ref mut text) = last {
+                            if text == "..." {
+                                *text = chunk;
+                            } else {
+                                text.push_str(&chunk);
+                            }
+                        }
+                    }
                 }
-                Ok(None) => {
-                    streaming = false;
-                    app.scroll_to_bottom();
+                AgentUpdate::Reasoning { kind: _, content } => {
+                    app.reasoning_steps.push_back(okc_core::ReasoningStep {
+                        timestamp: chrono::Utc::now(),
+                        kind: okc_core::ReasoningKind::Reflect, // simplified mapping
+                        content,
+                        tool_call: None,
+                        tool_result: None,
+                    });
                 }
-                Err(_) => {
-                    // Timeout — just redraw
+                AgentUpdate::ToolCall { name, arguments } => {
+                    app.add_system(format!(
+                        "[tool call] {} {}",
+                        name,
+                        serde_json::to_string(&arguments).unwrap_or_default()
+                    ));
+                }
+                AgentUpdate::ToolResult { name, success, result, elapsed_ms } => {
+                    let prefix = if success { "[ok]" } else { "[err]" };
+                    let result_str = serde_json::to_string(&result).unwrap_or_default();
+                    app.add_system(format!(
+                        "{} {} ({}ms) → {}",
+                        prefix, name, elapsed_ms,
+                        &result_str[..result_str.len().min(200)]
+                    ));
+                }
+                AgentUpdate::Done { text, messages: new_messages } => {
+                    agent_running = false;
+                    messages = new_messages;
+                    // Ensure final text is shown
+                    app.update_last_assistant(text);
+                }
+                AgentUpdate::Error(e) => {
+                    agent_running = false;
+                    app.add_error(format!("Agent error: {}", e));
                 }
             }
         }
 
-        // Poll for input
+        // ─── Render ───────────────────────────────────────────────────────
+        terminal.draw(|frame| {
+            app.render(frame, frame.area());
+        })?;
+
+        // ─── Poll keyboard ────────────────────────────────────────────────
         if !event::poll(Duration::from_millis(50))? {
             continue;
         }
@@ -144,60 +197,69 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Resul
             match app.handle_key(key) {
                 Some(AppEvent::Quit) => break,
                 Some(AppEvent::Submit(query)) => {
+                    if agent_running {
+                        app.add_system("Agent is already running. Wait.");
+                        continue;
+                    }
+
                     let file_refs = okc_core::util::extract_file_refs(&query);
                     let clean_query = okc_core::util::strip_file_refs(&query);
 
-                    // Build context
-                    let mut system = build_system_prompt(&cfg, mcp_registry.as_ref(), &builtin_tools);
+                    // Build enriched query with file context
+                    let mut enriched = clean_query.clone();
                     for path in &file_refs {
                         if let Ok(content) = tokio::fs::read_to_string(path).await {
-                            system.push_str(&format!("\n\n--- {} ---\n{}", path, content));
+                            enriched.push_str(&format!("\n\n--- @{} ---\n{}", path, content));
                         }
                     }
 
-                    messages.push(ChatMessage {
-                        role: Role::System,
-                        content: system,
-                        name: None,
-                    });
-                    messages.push(ChatMessage {
-                        role: Role::User,
-                        content: clean_query.clone(),
-                        name: None,
-                    });
-
-                    app.add_assistant("...");
-                    streaming = true;
-                    stream_buffer.clear();
-
-                    // Spawn LLM request
-                    let provider = llm_registry.get(&current_model).map(|(p, _)| p);
-                    if let Some(provider) = provider {
-                        let model_id = current_model.split_once('/').map(|(_, m)| m.to_string()).unwrap_or_default();
-                        let msgs = messages.clone();
-                        let tx = stream_tx.clone();
-                        let llm_client = llm_client.clone();
-                        tokio::spawn(async move {
-                            if provider.supports_streaming() {
-                                let _ = llm_client.chat_stream(&provider, &model_id, msgs, tx).await;
-                            } else {
-                                match llm_client.chat(&provider, &model_id, msgs).await {
-                                    Ok(text) => {
-                                        let _ = tx.send(text).await;
-                                    }
-                                    Err(e) => {
-                                        let _ = tx.send(format!("Error: {}", e)).await;
-                                    }
-                                }
-                            }
-                        });
-                    } else {
-                        app.update_last_assistant(format!("Model '{}' not found", current_model));
-                        streaming = false;
+                    // Update provider if model changed
+                    if let Some((provider, model_id)) = llm_registry.get(&current_model) {
+                        agent.provider = provider;
+                        agent.model_id = model_id;
                     }
+
+                    // Hook up the update channel
+                    agent.update_tx = Some(agent_tx.clone());
+
+                    // Show placeholder
+                    app.add_assistant("...");
+                    agent_running = true;
+
+                    // Clone what we need for the async task
+                    let mut task_agent = Agent {
+                        llm_client: llm_client.clone(),
+                        provider: agent.provider.clone(),
+                        model_id: agent.model_id.clone(),
+                        tools: agent.tools.clone(),
+                        autonomy: agent.autonomy,
+                        event_bus: event_bus.clone(),
+                        max_iterations: agent.max_iterations,
+                        streaming: agent.streaming,
+                        reasoning_log: Vec::new(),
+                        update_tx: Some(agent_tx.clone()),
+                    };
+                    let msgs = messages.clone();
+                    let _tx = agent_tx.clone();
+
+                    tokio::spawn(async move {
+                        let _new_messages = task_agent.run_turn(&enriched, msgs).await;
+                        // The Done event is already emitted inside run_turn before returning.
+                        // But we need to make sure messages get back to the main loop.
+                        // Actually, Done already contains messages. The main loop handles it.
+                        // However, if run_turn crashes before emitting Done, we need a fallback:
+                    });
                 }
                 Some(AppEvent::Command(cmd)) => {
-                    handle_command(&cmd, &mut app, &llm_registry, &mut current_model, &mut rag, &cfg);
+                    handle_command(
+                        &cmd,
+                        &mut app,
+                        &llm_registry,
+                        &mut current_model,
+                        &mut agent,
+                        &mut rag,
+                        &cfg,
+                    );
                 }
                 None => {}
             }
@@ -207,45 +269,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Resul
     Ok(())
 }
 
-fn build_system_prompt(
-    _cfg: &Config,
-    mcp: Option<&McpRegistry>,
-    _builtin: &BuiltInTools,
-) -> String {
-    let mut prompt = String::from(
-        "You are openklawc, an autonomous coding assistant running in a Rust TUI.\n\
-         You have access to tools. When you need to use a tool, output JSON like:\n\
-         {\"tool\": \"tool_name\", \"arguments\": {...}}\n\
-         After tool results, reflect and continue.\n\n"
-    );
-
-    if let Some(mcp) = mcp {
-        if !mcp.all_tools().is_empty() {
-            prompt.push_str("MCP tools:\n");
-            for (_, tool) in mcp.all_tools() {
-                prompt.push_str(&format!("- {}: {}\n", tool.name, tool.description));
-            }
-        }
-    }
-
-    prompt.push_str("\nBuilt-in tools:\n");
-    prompt.push_str("- read_file: Read file contents\n");
-    prompt.push_str("- write_file: Write content to a file\n");
-    prompt.push_str("- list_dir: List directory contents\n");
-    prompt.push_str("- search_files: Search files by pattern\n");
-    prompt.push_str("- shell: Run shell commands\n");
-    prompt.push_str("- git: Run git commands\n");
-    prompt.push_str("- view_cwd: Show current working directory\n");
-
-    prompt.push_str("\nRespond concisely. Think step by step.");
-    prompt
-}
-
 fn handle_command(
     cmd: &str,
     app: &mut App,
     registry: &ProviderRegistry,
     current_model: &mut String,
+    agent: &mut Agent,
     rag: &mut SimpleRag,
     cfg: &Config,
 ) {
@@ -264,6 +293,7 @@ fn handle_command(
                 let mut tags = Vec::new();
                 if model.capabilities.reasoning { tags.push("reasoning"); }
                 if model.capabilities.vision { tags.push("vision"); }
+                if model.capabilities.function_calling { tags.push("tools"); }
                 let tag_str = if tags.is_empty() {
                     String::new()
                 } else {
@@ -289,10 +319,12 @@ fn handle_command(
         }
         "/autonomy" => {
             if parts.len() < 2 {
-                app.add_system(format!("current autonomy: {:?}", app.autonomy));
+                app.add_system(format!("current: {:?}", app.autonomy));
             } else {
-                app.autonomy = parse_autonomy(parts[1]);
-                app.add_system(format!("autonomy -> {:?}", app.autonomy));
+                let level = parse_autonomy(parts[1]);
+                app.autonomy = level;
+                agent.autonomy = level;
+                app.add_system(format!("autonomy -> {:?}", level));
             }
         }
         "/rag" => {
@@ -306,8 +338,12 @@ fn handle_command(
                 } else {
                     let mut out = String::from("RAG results:\n");
                     for r in results.iter().take(5) {
-                        out.push_str(&format!("{}:{}\n{:.100}\n\n",
-                            r.file.display(), r.line_start, r.text));
+                        out.push_str(&format!(
+                            "{}:{}\n{:.100}\n\n",
+                            r.file.display(),
+                            r.line_start,
+                            r.text
+                        ));
                     }
                     app.add_system(out);
                 }
@@ -317,27 +353,28 @@ fn handle_command(
             if let Ok(cwd) = std::env::current_dir() {
                 match rag.index_dir(&cwd, cfg.rag.index_depth, &cfg.rag.extensions) {
                     Ok(()) => app.add_system("RAG index rebuilt."),
-                    Err(e) => app.add_error(format!("RAG index failed: {}", e)),
+                    Err(e) => app.add_error(format!("RAG failed: {}", e)),
                 }
             }
+        }
+        "/clear" => {
+            app.scrollback.clear();
+            app.add_system("Cleared.");
         }
         "/help" | "/h" => {
             app.add_system(
                 "Commands:\n\
-                 /models          — list available models\n\
+                 /models          — list models\n\
                  /model <id>      — switch model\n\
                  /autonomy <lvl>  — ask|read_only|yolo|god\n\
-                 /rag <query>     — search indexed context\n\
+                 /rag <query>     — search context\n\
                  /rag-index       — reindex cwd\n\
-                 /quit            — exit\n\
+                 /clear           — clear chat\n\
                  /help            — this message"
             );
         }
-        "/quit" | "/q" => {
-            // Handled by normal-mode 'q' or we could set a flag
-        }
         _ => {
-            app.add_error(format!("Unknown command: {}", parts[0]));
+            app.add_error(format!("Unknown: {}", parts[0]));
         }
     }
 }

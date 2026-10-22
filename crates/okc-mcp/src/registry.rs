@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use okc_config::McpServerConfig;
 use okc_core::{Id, ToolCall, ToolExecutor, ToolOutcome, ToolSchema};
 use tokio::sync::Mutex;
@@ -90,5 +91,16 @@ impl Registry {
 
     pub fn is_empty(&self) -> bool {
         self.clients.is_empty()
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for Registry {
+    async fn list_tools(&self) -> Result<Vec<ToolSchema>> {
+        Ok(self.all_tools.iter().map(|(_, t)| t.clone()).collect())
+    }
+
+    async fn execute_tool(&self, call: &ToolCall) -> Result<ToolOutcome> {
+        self.call_tool(call).await
     }
 }

@@ -378,6 +378,88 @@ pub trait LlmProvider: Send + Sync {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// TOOL CALL PARSING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Parse tool calls embedded in an LLM text response.
+/// 
+/// Detects several formats:
+///   1. OpenAI function call JSON: {"name":"tool","arguments":{...}}
+///   2. Anthropic tool use: {"tool":"name", "arguments":{...}}
+///   3. Code fence: ```json\n{"tool":"name",...}\n```
+///
+/// Returns (cleaned_response_text, tool_calls)
+pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
+    let mut tool_calls = Vec::new();
+    let mut cleaned = text.to_string();
+
+    // Extract fenced JSON blocks with "tool" or "name" + "arguments"
+    // Try fenced first
+    let fence_re = regex::Regex::new(r"```(?:json)?\s*\n(.*?)\n```").unwrap();
+    for cap in fence_re.captures_iter(text) {
+        let json_str = &cap[1];
+        if let Some(call) = try_parse_tool_json(json_str) {
+            tool_calls.push(call);
+            cleaned = cleaned.replace(&cap[0], "");
+        }
+    }
+
+    // Try inline JSON objects
+    let inline_re = regex::Regex::new(r"\{(?:[^{}]|\{[^{}]*\})*\}").unwrap();
+    for cap in inline_re.captures_iter(text) {
+        let json_str = &cap[0];
+        if let Some(call) = try_parse_tool_json(json_str) {
+            // Don't duplicate
+            if !tool_calls.iter().any(|c: &ToolCall| c.id.0 == call.id.0) {
+                tool_calls.push(call);
+                cleaned = cleaned.replace(&cap[0], "");
+            }
+        }
+    }
+
+    (cleaned.trim().to_string(), tool_calls)
+}
+
+fn try_parse_tool_json(json_str: &str) -> Option<ToolCall> {
+    let value: serde_json::Value = serde_json::from_str(json_str).ok()?;
+
+    // Format 1: {"tool": "name", "arguments": {...}}
+    if let Some(tool) = value.get("tool").and_then(|v| v.as_str()) {
+        let args = value.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
+        return Some(ToolCall {
+            id: Id::new(),
+            name: tool.to_string(),
+            arguments: args,
+        });
+    }
+
+    // Format 2: {"name": "name", "arguments": {...}} (OpenAI style)
+    if let Some(name) = value.get("name").and_then(|v| v.as_str()) {
+        let args = value.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
+        return Some(ToolCall {
+            id: Id::new(),
+            name: name.to_string(),
+            arguments: args,
+        });
+    }
+
+    // Format 3: {"function": {"name": "...", "arguments": "..."}} (OpenAI chat completion)
+    if let Some(func) = value.get("function") {
+        if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+            let args_str = func.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
+            let args = serde_json::from_str(args_str).unwrap_or(serde_json::Value::Null);
+            return Some(ToolCall {
+                id: Id::new(),
+                name: name.to_string(),
+                arguments: args,
+            });
+        }
+    }
+
+    None
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // SIMPLE SHARED TYPES
 // ═══════════════════════════════════════════════════════════════════════════════
 

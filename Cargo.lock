@@ -1076,6 +1076,7 @@ dependencies = [
  "dashmap",
  "indexmap",
  "parking_lot",
+ "regex",
  "serde",
  "serde_json",
  "strum",
@@ -1243,6 +1244,7 @@ name = "openklawc"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "crossterm",
  "okc-config",
  "okc-core",
@@ -1256,6 +1258,7 @@ dependencies = [
  "okc-tool",
  "okc-tui",
  "ratatui",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
