@@ -89,9 +89,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Resul
     // ─── Composite Tools (builtin + MCP) ────────────────────────────────────
     let mut composite = CompositeExecutor::new();
     composite.add(Arc::new(BuiltInTools::new()));
-    // NOTE: MCP tools could be added here if McpRegistry derived Clone.
-    // For v0.2, builtin tools cover file, git, shell, search operations.
-    let tools: Arc<dyn okc_core::ToolExecutor> = Arc::new(composite);
+    let mcp_tool_count = mcp_registry.as_ref().map(|r| r.all_tools().len()).unwrap_or(0);
+    let tools: Arc<dyn okc_core::ToolExecutor> = if let Some(mcp) = mcp_registry {
+        info!("MCP tools: {} registered", mcp.all_tools().len());
+        composite.add(Arc::new(mcp));
+        Arc::new(composite)
+    } else {
+        Arc::new(composite)
+    };
 
     // ─── Agent ──────────────────────────────────────────────────────────────
     let mut agent = Agent::new(
@@ -117,7 +122,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Resul
     let mut app = App::new();
     app.model = current_model.clone();
     app.autonomy = agent.autonomy;
-    app.mcp_count = mcp_registry.as_ref().map(|r| r.all_tools().len()).unwrap_or(0);
+    app.mcp_count = mcp_tool_count;
     app.show_reasoning = cfg.ui.show_reasoning;
 
     // ─── Conversation history ───────────────────────────────────────────────
