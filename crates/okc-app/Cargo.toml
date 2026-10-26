@@ -1,0 +1,23 @@
+[package]
+name = "okc-app"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+okc-core = { workspace = true }
+okc-config = { workspace = true }
+okc-llm = { workspace = true }
+okc-mcp = { workspace = true }
+okc-reasoning = { workspace = true }
+okc-session = { workspace = true }
+okc-rag = { workspace = true }
+okc-tool = { workspace = true }
+
+tokio = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }

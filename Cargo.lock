@@ -1582,6 +1582,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "okc-app"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "okc-config",
+ "okc-core",
+ "okc-llm",
+ "okc-mcp",
+ "okc-rag",
+ "okc-reasoning",
+ "okc-session",
+ "okc-tool",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "okc-config"
 version = "0.2.0"
 dependencies = [
@@ -1800,16 +1819,9 @@ dependencies = [
  "anyhow",
  "chrono",
  "crossterm",
- "okc-config",
+ "okc-app",
  "okc-core",
- "okc-git",
- "okc-llm",
- "okc-mcp",
- "okc-plugin",
- "okc-rag",
  "okc-reasoning",
- "okc-session",
- "okc-tool",
  "okc-tui",
  "ratatui",
  "serde_json",

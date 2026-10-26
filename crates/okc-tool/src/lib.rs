@@ -35,7 +35,6 @@ impl Default for BuiltInTools {
 impl BuiltInTools {
     pub fn new() -> Self {
         let mut schemas = HashMap::new();
-
         schemas.insert(
             "read_file".to_string(),
             ToolSchema {
@@ -153,6 +152,35 @@ impl BuiltInTools {
             },
         );
 
+        Self { schemas }
+    }
+
+    /// Build the tool set honouring the `[tools]` enablement flags from the
+    /// config. Unknown flags keep nothing extra; every built-in tool maps to
+    /// exactly one flag.
+    pub fn with_enabled(cfg: &okc_config::ToolConfig) -> Self {
+        let mut keep: Vec<&str> = Vec::new();
+        if cfg.shell {
+            keep.push("shell");
+        }
+        if cfg.file_read {
+            keep.extend(["read_file", "list_dir", "view_cwd"]);
+        }
+        if cfg.file_write {
+            keep.push("write_file");
+        }
+        if cfg.git {
+            keep.push("git");
+        }
+        if cfg.search {
+            keep.push("search_files");
+        }
+        let all = Self::new();
+        let schemas = all
+            .schemas
+            .into_iter()
+            .filter(|(name, _)| keep.contains(&name.as_str()))
+            .collect();
         Self { schemas }
     }
 }

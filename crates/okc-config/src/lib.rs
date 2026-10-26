@@ -1,7 +1,7 @@
 //! openklawc-config — loads merged configuration from files and env.
 //!
 //! Config hierarchy (highest priority first):
-//!   1. Environment variables (`OKC_*`)
+//!   1. Environment variables: `OKC_MODEL`, `OKC_AUTONOMY` (applied at boot)
 //!   2. Project-local `.openklawc.toml`
 //!   3. User config `~/.config/openklawc/config.toml`
 //!   4. Built-in defaults
@@ -169,7 +169,10 @@ pub struct PluginConfig {
     pub disabled: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// Built-in tool enablement. All tools default to ON; the derived `Default`
+/// used to flip them all OFF because `#[serde(default = "true_fn")]` only
+/// applies to keys missing from the file, not to `Config::default()`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolConfig {
     #[serde(default = "true_fn")]
     pub shell: bool,
@@ -184,6 +187,19 @@ pub struct ToolConfig {
     /// User-defined custom tools (shell-based).
     #[serde(default)]
     pub custom: Vec<CustomToolDef>,
+}
+
+impl Default for ToolConfig {
+    fn default() -> Self {
+        Self {
+            shell: true,
+            file_read: true,
+            file_write: true,
+            git: true,
+            search: true,
+            custom: Vec::new(),
+        }
+    }
 }
 
 /// One user-defined custom tool.
@@ -223,6 +239,14 @@ pub struct OrchestratorConfig {
     /// Length threshold (chars) above which tool results are summarized.
     #[serde(default = "default_summarize_threshold")]
     pub summarize_threshold: usize,
+    /// Hard per-call timeout for tool execution (including MCP calls), so a
+    /// hung server cannot wedge the agent loop.
+    #[serde(default = "default_call_timeout_ms")]
+    pub call_timeout_ms: u64,
+}
+
+fn default_call_timeout_ms() -> u64 {
+    60_000
 }
 
 impl Default for OrchestratorConfig {
@@ -235,6 +259,7 @@ impl Default for OrchestratorConfig {
             retry_delay_ms: default_retry_delay_ms(),
             summarize_results: true,
             summarize_threshold: default_summarize_threshold(),
+            call_timeout_ms: default_call_timeout_ms(),
         }
     }
 }

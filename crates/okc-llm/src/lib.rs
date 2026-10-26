@@ -108,6 +108,21 @@ impl ProviderRegistry {
         self.default_model = id;
     }
 
+    /// Register a provider and its models directly. Used by embedders and
+    /// tests that need to inject a provider without going through config.
+    pub fn register(&mut self, name: &str, provider: Arc<dyn LlmProvider>, models: Vec<String>) {
+        self.providers.insert(name.to_string(), provider);
+        for model_id in models {
+            let display = format!("{}/{}", name, model_id);
+            self.models.push(ModelRef {
+                provider: name.to_string(),
+                capabilities: detect_capabilities(&model_id),
+                display_name: display,
+                model_id,
+            });
+        }
+    }
+
     pub fn get(&self, qualified_id: &str) -> Option<(Arc<dyn LlmProvider>, String)> {
         let (provider_name, model_id) = qualified_id.split_once('/')?;
         let provider = self.providers.get(provider_name)?.clone();

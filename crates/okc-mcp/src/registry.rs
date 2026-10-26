@@ -23,9 +23,19 @@ impl Registry {
     /// not mention are launched automatically; a configuration entry always
     /// wins and may disable a bundled server.
     pub async fn start(mcp_configs: &HashMap<String, McpServerConfig>) -> Result<Self> {
+        Ok(Self::start_with_report(mcp_configs).await?.0)
+    }
+
+    /// Like [`Registry::start`], but also returns the list of servers that
+    /// failed to start (`name: error`), so callers can surface degraded
+    /// tooling instead of silently running with fewer tools.
+    pub async fn start_with_report(
+        mcp_configs: &HashMap<String, McpServerConfig>,
+    ) -> Result<(Self, Vec<String>)> {
         let resolved = crate::bundled::resolve_configs(mcp_configs);
         let mut clients = HashMap::new();
         let mut all_tools = Vec::new();
+        let mut failures = Vec::new();
 
         for (name, cfg) in &resolved {
             if !cfg.enabled {
@@ -33,6 +43,7 @@ impl Registry {
             }
             if cfg.command.trim().is_empty() {
                 warn!("MCP '{}' has no command configured — skipping", name);
+                failures.push(format!("{}: no command configured", name));
                 continue;
             }
             let args: Vec<String> = cfg.args.clone();
@@ -52,11 +63,12 @@ impl Registry {
                 }
                 Err(e) => {
                     warn!("Failed to start MCP '{}': {}", name, e);
+                    failures.push(format!("{}: {}", name, e));
                 }
             }
         }
 
-        Ok(Self { clients, all_tools })
+        Ok((Self { clients, all_tools }, failures))
     }
 
     pub fn all_tools(&self) -> &[(String, ToolSchema)] {

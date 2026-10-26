@@ -1,15 +1,14 @@
 //! openklawc — autonomous Rust coding agent.
 //!
-//! Architecture inspired by:
-//!   - opencode (feature-rich AI dev tool)
-//!   - openclaude (Rust TUI patterns)
-//!   - hermes (Nous Research agent loop — plan → execute → reflect)
+//! Thin binary: parse arguments, pick a front-end (TUI or headless), and
+//! drive the application core in `okc-app`. Bootstrap, tool assembly, model
+//! resolution, session lifecycle and persistence all live there.
 
 use std::io::{self, stdout};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use crossterm::{
     event::{self, Event},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -17,16 +16,10 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::mpsc;
-use tracing::{info, warn};
 
-use okc_config::{Config, ModelPricing};
-use okc_core::{AutonomyLevel, ChatMessage, EventBus, TokenUsage};
-use okc_llm::{LlmClient, ProviderRegistry};
-use okc_mcp::McpRegistry;
-use okc_rag::SimpleRag;
-use okc_reasoning::{Agent, AgentUpdate, ConfirmRequest};
-use okc_session::{SessionConfig, SessionStore};
-use okc_tool::{BuiltInTools, CompositeExecutor, CustomTools};
+use okc_app::{parse_autonomy, title_from, App as CoreApp, AppOptions};
+use okc_core::{ChatMessage, TokenUsage};
+use okc_reasoning::{AgentUpdate, ConfirmRequest};
 use okc_tui::{App, AppEvent, ChatSession, PickerItem, Theme};
 
 /// Command-line arguments.
@@ -80,11 +73,22 @@ impl Args {
          -h, --help            show this help\n\n\
          Autonomy:\n\
          read_only (default) mutating tools need approval — in the TUI you are\n\
-         asked, headless runs deny them. Use --autonomy yolo to allow them.\n\n\
+         asked, headless runs deny them. Use --autonomy yolo to allow them unattended.\n\n\
+         Environment:\n  \
+         OKC_MODEL, OKC_AUTONOMY   override model / autonomy (beat every config file)\n\n\
          MCP servers:\n  \
          The bundled Rust servers (filesystem, brave-search, playwright, vision, local-brain,\n  \
          laya) start automatically. A [mcp.<name>] entry in .openklawc.toml or\n  \
          ~/.config/openklawc/config.toml overrides one; set enabled = false to switch it off.\n"
+    }
+
+    fn options(&self) -> AppOptions {
+        AppOptions {
+            model: self.model.clone(),
+            autonomy: self.autonomy.clone().map(|a| parse_autonomy(&a)),
+            persona: self.persona.clone(),
+            start_mcp: !self.no_mcp,
+        }
     }
 }
 
@@ -103,8 +107,6 @@ async fn main() -> Result<()> {
         return run_headless(&args, prompt).await;
     }
 
-    info!("openklawc starting...");
-
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
@@ -118,66 +120,31 @@ async fn main() -> Result<()> {
     result
 }
 
-/// Run a single turn without the TUI. Used for scripting and for verifying
-/// the provider/tool wiring end to end.
+/// Headless front-end: one turn, printed to stdout/stderr, then exit.
 async fn run_headless(args: &Args, prompt: String) -> Result<()> {
-    let cfg = Config::load_default().unwrap_or_default();
-    let event_bus = EventBus::new(256);
+    let (mut core, boot) = CoreApp::boot(args.options()).await?;
 
-    let registry = ProviderRegistry::from_config(&cfg);
-    let model_id = args.model.clone().unwrap_or_else(|| cfg.model.clone());
-    let (provider, model) = registry.get(&model_id).ok_or_else(|| {
-        anyhow!(
-            "unknown model '{}' — run /models inside the TUI to list available models",
-            model_id
-        )
-    })?;
-
-    // ─── Tools (built-in + custom + MCP) ───────────────────────────────────
-    let mut composite = CompositeExecutor::new();
-    composite.add(Arc::new(BuiltInTools::new()));
-    composite.add(Arc::new(CustomTools::from_config(&cfg)));
-    if !args.no_mcp {
-        match McpRegistry::start(&cfg.mcp).await {
-            Ok(r) => {
-                eprintln!("[mcp] {} tools registered", r.all_tools().len());
-                composite.add(Arc::new(r));
-            }
-            Err(e) => eprintln!("[mcp] startup failed: {}", e),
-        }
+    for failure in &boot.mcp_failures {
+        eprintln!("[mcp] failed to start: {}", failure);
     }
-    let tools: Arc<dyn okc_core::ToolExecutor> = Arc::new(composite);
+    eprintln!("[mcp] {} tools registered", boot.mcp_tools);
+    eprintln!("[model] {}", boot.model);
 
-    let level = args
-        .autonomy
-        .clone()
-        .unwrap_or_else(|| cfg.autonomy.default_level.clone());
-    let autonomy = parse_autonomy(&level);
+    // Headless runs never attach an approval channel, so any tool call that
+    // needs confirmation is denied — by construction, not by accident.
+    let session_id = core.create_session(&title_from(&prompt), "build");
+    let mut persisted: usize = 0;
 
-    let mut agent = Agent::new(
-        LlmClient::new(),
-        provider,
-        model,
-        tools,
-        autonomy,
-        event_bus.clone(),
-    );
+    let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done_store: Arc<std::sync::Mutex<Option<(Vec<ChatMessage>, Option<TokenUsage>)>>> =
+        Arc::new(std::sync::Mutex::new(None));
 
-    if let Some(persona) = build_persona(args, &cfg) {
-        agent = agent.with_persona(persona);
-    }
+    let rx = core.submit(&prompt, Vec::new()).await;
 
-    let (tx, mut rx) = mpsc::channel::<AgentUpdate>(256);
-    agent.update_tx = Some(tx);
-
-    // Headless runs are saved too, so they show up in the chat picker.
-    let mut session_store = SessionStore::new().ok();
-    let mut session_id: Option<String> = None;
-
-    let failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let printer_failed = failed.clone();
+    let printer_done = done_store.clone();
     let printer = tokio::spawn(async move {
-        let mut turn_usage: Option<TokenUsage> = None;
+        let mut rx = rx;
         while let Some(update) = rx.recv().await {
             match update {
                 AgentUpdate::TextChunk(chunk) => print!("{}", chunk),
@@ -199,73 +166,26 @@ async fn run_headless(args: &Args, prompt: String) -> Result<()> {
                 } => {
                     let status = if success { "ok" } else { "err" };
                     let body = serde_json::to_string(&result).unwrap_or_default();
-                    eprintln!(
-                        "[{}] {} ({}ms) {}",
-                        status,
-                        name,
-                        elapsed_ms,
-                        truncate(&body, 200)
-                    );
+                    eprintln!("[{}] {} ({}ms) {}", status, name, elapsed_ms, truncate(&body, 200));
                 }
                 AgentUpdate::Error(e) => {
                     eprintln!("[error] {}", e);
                     printer_failed.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
-                AgentUpdate::Done { usage, .. } => {
-                    turn_usage = usage;
+                AgentUpdate::Done { messages, usage, .. } => {
+                    *printer_done.lock().unwrap() = Some((messages, usage));
                 }
             }
         }
-        turn_usage
     });
-
-    eprintln!("[model] {}", model_id);
-    let final_messages = agent.run_turn(&prompt, Vec::new()).await;
-
-    // Dropping the sender closes the channel so the printer can finish.
-    agent.update_tx = None;
-    let turn_usage = printer.await.unwrap_or(None);
+    printer.await.ok();
     println!();
 
     // Persist the run.
-    if let Some(store) = session_store.as_mut() {
-        let cwd = std::env::current_dir()
-            .ok()
-            .map(|p| p.to_string_lossy().to_string());
-        let provider = model_id.split('/').next().map(|s| s.to_string());
-        let session_cfg = SessionConfig {
-            agent_mode: Some("build".to_string()),
-            ..Default::default()
-        };
-        match store.create_with_config(
-            &title_from(&prompt),
-            Some(&model_id),
-            provider.as_deref(),
-            cwd.as_deref(),
-            &session_cfg,
-        ) {
-            Ok(id) => {
-                if let Err(e) = store.sync_messages(&id, &final_messages, 0) {
-                    warn!("failed to persist headless session: {}", e);
-                }
-                if let Some(u) = turn_usage {
-                    if let Ok(mut session_cfg) = store.get_config(&id) {
-                        session_cfg.tokens_in += u.prompt;
-                        session_cfg.tokens_out += u.completion;
-                        session_cfg.cost_usd = cost_for(
-                            &cfg.pricing,
-                            &model_id,
-                            TokenUsage::new(session_cfg.tokens_in, session_cfg.tokens_out),
-                        );
-                        let _ = store.set_config(&id, &session_cfg);
-                    }
-                }
-                session_id = Some(id);
-            }
-            Err(e) => warn!("failed to create headless session: {}", e),
-        }
-    }
     if let Some(id) = &session_id {
+        if let Some((messages, usage)) = done_store.lock().unwrap().take() {
+            core.persist_turn(id, &mut persisted, &messages, usage);
+        }
         eprintln!("[session] {}", &id[..8.min(id.len())]);
     }
 
@@ -275,192 +195,114 @@ async fn run_headless(args: &Args, prompt: String) -> Result<()> {
     Ok(())
 }
 
+/// TUI front-end: render loop plus keyboard handling. All engine work goes
+/// through the `okc-app` core.
 async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, args: &Args) -> Result<()> {
-    // ─── Config ─────────────────────────────────────────────────────────────
-    let cfg = Config::load_default().unwrap_or_default();
-    let event_bus = EventBus::new(256);
+    let (mut core, boot) = CoreApp::boot(args.options()).await?;
 
-    // ─── LLM ────────────────────────────────────────────────────────────────
-    let llm_registry = ProviderRegistry::from_config(&cfg);
-    let llm_client = LlmClient::new();
-    let mut current_model = cfg.model.clone();
-
-    let (default_provider, default_model_id) =
-        llm_registry.get(&current_model).unwrap_or_else(|| {
-            let first = llm_registry.list().first().cloned();
-            let p = first
-                .as_ref()
-                .and_then(|m| llm_registry.get(&format!("{}/{}", m.provider, m.model_id)));
-            p.unwrap_or_else(|| {
-                let ollama = Arc::new(okc_llm::OllamaProvider::new("http://localhost:11434"));
-                (ollama, "qwen3".to_string())
-            })
-        });
-
-    // ─── MCP ────────────────────────────────────────────────────────────────
-    let mcp_registry = if args.no_mcp {
-        None
-    } else {
-        match McpRegistry::start(&cfg.mcp).await {
-            Ok(r) => {
-                info!("MCP registry: {} tools", r.all_tools().len());
-                Some(r)
-            }
-            Err(e) => {
-                warn!("MCP startup failed: {}", e);
-                None
-            }
-        }
-    };
-
-    // ─── Composite Tools (builtin + custom + MCP) ───────────────────────────
-    let mut composite = CompositeExecutor::new();
-    composite.add(Arc::new(BuiltInTools::new()));
-    composite.add(Arc::new(CustomTools::from_config(&cfg)));
-    let mcp_tool_count = mcp_registry
-        .as_ref()
-        .map(|r| r.all_tools().len())
-        .unwrap_or(0);
-    let tools: Arc<dyn okc_core::ToolExecutor> = if let Some(mcp) = mcp_registry {
-        info!("MCP tools: {} registered", mcp.all_tools().len());
-        composite.add(Arc::new(mcp));
-        Arc::new(composite)
-    } else {
-        Arc::new(composite)
-    };
-
-    // ─── Agent ──────────────────────────────────────────────────────────────
-    // The CLI flag wins over the configured default.
-    let autonomy = parse_autonomy(
-        args.autonomy
-            .as_deref()
-            .unwrap_or(&cfg.autonomy.default_level),
-    );
-    let mut agent = Agent::new(
-        llm_client.clone(),
-        default_provider,
-        default_model_id,
-        tools,
-        autonomy,
-        event_bus.clone(),
-    );
-    agent.streaming = cfg.ui.stream_responses;
-
-    if let Some(persona) = build_persona(args, &cfg) {
-        agent = agent.with_persona(persona);
-    }
-
-    // ─── RAG ────────────────────────────────────────────────────────────────
-    let mut rag = SimpleRag::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        let _ = rag.index_dir(&cwd, cfg.rag.index_depth, &cfg.rag.extensions);
-    }
-
-    // ─── Session ────────────────────────────────────────────────────────────
-    let mut session_store = SessionStore::new().ok();
-    // How many entries of `messages` are already written to the database.
-    let mut persisted_count: usize = 0;
-
-    // ─── Tool approval channel ──────────────────────────────────────────────
+    // The TUI can ask a human: attach the approval channel.
     let (confirm_tx, mut confirm_rx) = mpsc::channel::<ConfirmRequest>(32);
-    agent.confirm_tx = Some(confirm_tx.clone());
+    core.attach_approval(confirm_tx);
 
-    // ─── TUI ────────────────────────────────────────────────────────────────
     let mut app = App::new();
-    app.model = current_model.clone();
-    app.autonomy = agent.autonomy;
-    app.mcp_count = mcp_tool_count;
-    app.show_reasoning = cfg.ui.show_reasoning;
-    app.theme = Theme::from_name(&cfg.ui.theme);
+    app.model = boot.model.clone();
+    app.autonomy = core.agent.autonomy;
+    app.mcp_count = boot.mcp_tools;
+    app.show_reasoning = core.cfg.ui.show_reasoning;
+    app.theme = Theme::from_name(&core.cfg.ui.theme);
+    for failure in &boot.mcp_failures {
+        app.add_system(format!("[mcp] failed to start: {}", failure));
+    }
 
-    // ─── Conversation history ───────────────────────────────────────────────
     let mut messages: Vec<ChatMessage> = Vec::new();
-
-    // ─── Agent ↔ TUI channel ────────────────────────────────────────────────
-    let (agent_tx, mut agent_rx) = mpsc::channel::<AgentUpdate>(256);
-
-    // ─── Main loop state ────────────────────────────────────────────────────
+    let mut persisted_count: usize = 0;
     let mut agent_running = false;
+    let mut rx: Option<mpsc::Receiver<AgentUpdate>> = None;
     let mut pending_confirms: std::collections::VecDeque<ConfirmRequest> =
         std::collections::VecDeque::new();
 
     loop {
-        // ─── Drain agent updates ──────────────────────────────────────────
-        while let Ok(update) = agent_rx.try_recv() {
-            match update {
-                AgentUpdate::TextChunk(chunk) => {
-                    // Append to the last assistant message
-                    if let Some(okc_tui::app::ScrollEntry::Assistant(text)) =
-                        app.scrollback.last_mut()
-                    {
-                        if text == "..." {
-                            *text = chunk;
-                        } else {
-                            text.push_str(&chunk);
+        // ─── Drain agent updates ──────────────────────────────────────
+        if let Some(stream) = rx.as_mut() {
+            loop {
+                match stream.try_recv() {
+                    Ok(update) => match update {
+                        AgentUpdate::TextChunk(chunk) => {
+                            if let Some(okc_tui::app::ScrollEntry::Assistant(text)) =
+                                app.scrollback.last_mut()
+                            {
+                                if text == "..." {
+                                    *text = chunk;
+                                } else {
+                                    text.push_str(&chunk);
+                                }
+                            }
                         }
+                        AgentUpdate::Reasoning { kind: _, content } => {
+                            app.reasoning_steps.push_back(okc_core::ReasoningStep {
+                                timestamp: chrono::Utc::now(),
+                                kind: okc_core::ReasoningKind::Reflect, // simplified mapping
+                                content,
+                                tool_call: None,
+                                tool_result: None,
+                                decision: okc_core::DecisionMetadata::default(),
+                            });
+                        }
+                        AgentUpdate::ToolCall { name, arguments } => {
+                            app.add_system(format!(
+                                "[tool call] {} {}",
+                                name,
+                                serde_json::to_string(&arguments).unwrap_or_default()
+                            ));
+                        }
+                        AgentUpdate::ToolResult {
+                            name,
+                            success,
+                            result,
+                            elapsed_ms,
+                        } => {
+                            let prefix = if success { "[ok]" } else { "[err]" };
+                            let result_str =
+                                serde_json::to_string(&result).unwrap_or_default();
+                            app.add_system(format!(
+                                "{} {} ({}ms) → {}",
+                                prefix,
+                                name,
+                                elapsed_ms,
+                                &result_str[..result_str.len().min(200)]
+                            ));
+                        }
+                        AgentUpdate::Done {
+                            text,
+                            messages: new_messages,
+                            usage,
+                        } => {
+                            agent_running = false;
+                            messages = new_messages;
+                            app.update_last_assistant(text);
+                            if let Some(sid) = app.current_session_id.clone() {
+                                core.persist_turn(&sid, &mut persisted_count, &messages, usage);
+                                app.token_count = core.session_tokens(&sid) as usize;
+                            }
+                        }
+                        AgentUpdate::Error(e) => {
+                            agent_running = false;
+                            app.add_error(format!("Agent error: {}", e));
+                        }
+                    },
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        // Turn finished (Done already drained) or the task
+                        // died; either way nothing more arrives.
+                        rx = None;
+                        agent_running = false;
+                        break;
                     }
-                }
-                AgentUpdate::Reasoning { kind: _, content } => {
-                    app.reasoning_steps.push_back(okc_core::ReasoningStep {
-                        timestamp: chrono::Utc::now(),
-                        kind: okc_core::ReasoningKind::Reflect, // simplified mapping
-                        content,
-                        tool_call: None,
-                        tool_result: None,
-                        decision: okc_core::DecisionMetadata::default(),
-                    });
-                }
-                AgentUpdate::ToolCall { name, arguments } => {
-                    app.add_system(format!(
-                        "[tool call] {} {}",
-                        name,
-                        serde_json::to_string(&arguments).unwrap_or_default()
-                    ));
-                }
-                AgentUpdate::ToolResult {
-                    name,
-                    success,
-                    result,
-                    elapsed_ms,
-                } => {
-                    let prefix = if success { "[ok]" } else { "[err]" };
-                    let result_str = serde_json::to_string(&result).unwrap_or_default();
-                    app.add_system(format!(
-                        "{} {} ({}ms) → {}",
-                        prefix,
-                        name,
-                        elapsed_ms,
-                        &result_str[..result_str.len().min(200)]
-                    ));
-                }
-                AgentUpdate::Done {
-                    text,
-                    messages: new_messages,
-                    usage,
-                } => {
-                    agent_running = false;
-                    messages = new_messages;
-                    // Ensure final text is shown
-                    app.update_last_assistant(text);
-
-                    persist_turn(
-                        session_store.as_mut(),
-                        &mut persisted_count,
-                        &mut app,
-                        &messages,
-                        &current_model,
-                        &cfg.pricing,
-                        usage,
-                    );
-                }
-                AgentUpdate::Error(e) => {
-                    agent_running = false;
-                    app.add_error(format!("Agent error: {}", e));
                 }
             }
         }
 
-        // ─── Pending tool approvals ──────────────────────────────────────
+        // ─── Pending tool approvals ───────────────────────────────────
         while let Ok(request) = confirm_rx.try_recv() {
             pending_confirms.push_back(request);
         }
@@ -478,12 +320,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, args: &A
             }
         }
 
-        // ─── Render ───────────────────────────────────────────────────────
+        // ─── Render ───────────────────────────────────────────────────
         terminal.draw(|frame| {
             app.render(frame, frame.area());
         })?;
 
-        // ─── Poll keyboard ────────────────────────────────────────────────
+        // ─── Poll keyboard ────────────────────────────────────────────
         if !event::poll(Duration::from_millis(50))? {
             continue;
         }
@@ -498,53 +340,24 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, args: &A
                         continue;
                     }
 
-                    let file_refs = okc_core::util::extract_file_refs(&query);
-                    let clean_query = okc_core::util::strip_file_refs(&query);
-
-                    // Build enriched query with file context
-                    let mut enriched = clean_query.clone();
-                    for path in &file_refs {
-                        if let Ok(content) = tokio::fs::read_to_string(path).await {
-                            enriched.push_str(&format!("\n\n--- @{} ---\n{}", path, content));
-                        }
-                    }
-
-                    // Update provider if model changed
-                    if let Some((provider, model_id)) = llm_registry.get(&current_model) {
-                        agent.provider = provider;
-                        agent.model_id = model_id;
-                    }
-
-                    // Hook up the update channel
-                    agent.update_tx = Some(agent_tx.clone());
-
                     // Start a session the first time the user talks, so the
                     // chat picker has something to show.
                     if app.current_session_id.is_none() {
-                        start_session(
-                            session_store.as_mut(),
-                            &mut app,
-                            &mut persisted_count,
-                            &title_from(&clean_query),
-                            &current_model,
-                        );
+                        let title = title_from(&query);
+                        let mode = app.chat_picker.mode.as_str().to_string();
+                        if let Some(id) = core.create_session(&title, &mode) {
+                            app.current_session_id = Some(id);
+                            persisted_count = 0;
+                        }
                     }
 
-                    // Show placeholder
                     app.add_assistant("...");
                     agent_running = true;
-
-                    // Clone what we need for the async task
-                    let mut task_agent = agent.fork();
-                    task_agent.update_tx = Some(agent_tx.clone());
-                    let msgs = messages.clone();
-
-                    tokio::spawn(async move {
-                        let _new_messages = task_agent.run_turn(&enriched, msgs).await;
-                    });
+                    rx = Some(core.submit(&query, messages.clone()).await);
                 }
                 Some(AppEvent::ListModels) => {
-                    let items: Vec<PickerItem> = llm_registry
+                    let items: Vec<PickerItem> = core
+                        .llm_registry
                         .list()
                         .iter()
                         .map(|m| {
@@ -574,98 +387,68 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, args: &A
                     app.set_overlay_items(items);
                 }
                 Some(AppEvent::ListSessions) => {
-                    let items = if let Some(ref store) = session_store {
-                        match store.list(50) {
-                            Ok(sessions) => sessions
-                                .into_iter()
-                                .map(|s| PickerItem {
-                                    id: s.id.clone(),
-                                    title: s.name.clone(),
-                                    subtitle: Some(format!(
-                                        "{} msgs • {} • {}",
-                                        s.message_count,
-                                        s.model.as_deref().unwrap_or("no model"),
-                                        s.updated_at.format("%Y-%m-%d %H:%M")
-                                    )),
-                                })
-                                .collect(),
-                            Err(e) => {
-                                app.add_error(format!("Failed to list sessions: {}", e));
-                                Vec::new()
-                            }
-                        }
-                    } else {
-                        app.add_error("Session store unavailable");
-                        Vec::new()
-                    };
+                    let items = core
+                        .list_sessions(50)
+                        .into_iter()
+                        .map(|s| PickerItem {
+                            id: s.id.clone(),
+                            title: s.name.clone(),
+                            subtitle: Some(format!(
+                                "{} msgs • {} • {}",
+                                s.message_count,
+                                s.model.as_deref().unwrap_or("no model"),
+                                s.updated_at.format("%Y-%m-%d %H:%M")
+                            )),
+                        })
+                        .collect();
                     app.set_overlay_items(items);
                 }
                 Some(AppEvent::SwitchModel(id)) => {
-                    if llm_registry.get(&id).is_some() {
-                        current_model = id.clone();
-                        app.model = id;
-                        app.add_system(format!("Switched to {}", current_model));
+                    if core.set_model(&id) {
+                        app.model = id.clone();
+                        app.add_system(format!("Switched to {}", id));
                     } else {
                         app.add_error(format!("Unknown model: {}", id));
                     }
                 }
                 Some(AppEvent::ResumeSession(id)) => {
-                    if let Some(ref store) = session_store {
-                        match store.get_messages(&id) {
-                            Ok(persisted) => {
-                                messages = persisted
-                                    .iter()
-                                    .filter(|pm| pm.role != "system")
-                                    .map(|pm| match pm.role.as_str() {
-                                        "assistant" => ChatMessage::assistant(pm.content.clone()),
-                                        _ => ChatMessage::user(pm.content.clone()),
-                                    })
-                                    .collect();
-                                // Rebuild the visible transcript too — otherwise
-                                // the model has the history but the user does not.
-                                let transcript: Vec<(String, String)> = persisted
-                                    .iter()
-                                    .map(|pm| (pm.role.clone(), pm.content.clone()))
-                                    .collect();
-                                app.set_transcript(&transcript);
-                                app.current_session_id = Some(id.clone());
-                                persisted_count = persisted.len();
-                                app.token_count = 0;
-                                if let Ok(config) = store.get_config(&id) {
-                                    app.token_count =
-                                        (config.tokens_in + config.tokens_out) as usize;
-                                }
-                                app.add_system(format!(
-                                    "Resumed session {}",
-                                    &id[..8.min(id.len())]
-                                ));
-                            }
-                            Err(e) => app.add_error(format!("Failed to resume: {}", e)),
+                    match core.get_messages(&id) {
+                        Some(persisted) => {
+                            messages = persisted
+                                .iter()
+                                .filter(|pm| pm.role != "system")
+                                .map(|pm| match pm.role.as_str() {
+                                    "assistant" => ChatMessage::assistant(pm.content.clone()),
+                                    _ => ChatMessage::user(pm.content.clone()),
+                                })
+                                .collect();
+                            // Rebuild the visible transcript too — otherwise
+                            // the model has the history but the user does not.
+                            let transcript: Vec<(String, String)> = persisted
+                                .iter()
+                                .map(|pm| (pm.role.clone(), pm.content.clone()))
+                                .collect();
+                            app.set_transcript(&transcript);
+                            app.current_session_id = Some(id.clone());
+                            persisted_count = persisted.len();
+                            app.token_count = core.session_tokens(&id) as usize;
+                            app.add_system(format!(
+                                "Resumed session {}",
+                                &id[..8.min(id.len())]
+                            ));
                         }
+                        None => app.add_error("Failed to resume: session not found"),
                     }
                 }
                 Some(AppEvent::SetAutonomy(level)) => {
-                    agent.autonomy = level;
+                    core.set_autonomy(level);
                 }
                 Some(AppEvent::OpenChatPicker) => {
-                    let sessions = match session_store.as_ref() {
-                        Some(store) => load_chat_sessions(store),
-                        None => {
-                            app.add_error("Session store unavailable");
-                            Vec::new()
-                        }
-                    };
-                    app.chat_picker.set_sessions(sessions);
+                    app.chat_picker.set_sessions(load_chat_sessions(&core));
                 }
                 Some(AppEvent::CreateSession(mode)) => {
                     let name = format!("New {} chat", mode.label().to_lowercase());
-                    match start_session(
-                        session_store.as_mut(),
-                        &mut app,
-                        &mut persisted_count,
-                        &name,
-                        &current_model,
-                    ) {
+                    match core.create_session(&name, mode.as_str()) {
                         Some(id) => {
                             messages.clear();
                             app.clear_transcript();
@@ -688,15 +471,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, args: &A
                         }
                     }
                     // Refresh the list so the new chat shows up.
-                    if let Some(store) = session_store.as_ref() {
-                        app.chat_picker.set_sessions(load_chat_sessions(store));
-                    }
+                    app.chat_picker.set_sessions(load_chat_sessions(&core));
                 }
                 Some(AppEvent::DeleteSession(id)) => {
-                    let deleted = match session_store.as_mut() {
-                        Some(store) => store.delete(&id).is_ok(),
-                        None => false,
-                    };
+                    let deleted = core.delete_session(&id);
                     if deleted {
                         if app.current_session_id.as_deref() == Some(id.as_str()) {
                             app.current_session_id = None;
@@ -711,40 +489,30 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, args: &A
                         app.chat_picker.notice = Some("Could not delete the chat".to_string());
                         app.add_error("Could not delete the chat");
                     }
-                    if let Some(store) = session_store.as_ref() {
-                        app.chat_picker.set_sessions(load_chat_sessions(store));
-                    }
+                    app.chat_picker.set_sessions(load_chat_sessions(&core));
                 }
                 Some(AppEvent::ConfirmTool(approved)) => {
+                    // Take ownership, then answer. A failed send means the
+                    // agent side is already gone — nothing to notify.
                     if let Some(request) = pending_confirms.pop_front() {
                         let _ = request.respond.send(approved);
                     }
                     app.pending_confirm = None;
                 }
                 Some(AppEvent::SearchHistory(query)) => {
-                    let items = if let Some(ref store) = session_store {
-                        match store.search(&query, 20) {
-                            Ok(results) => results
-                                .into_iter()
-                                .map(|r| PickerItem {
-                                    id: r.meta.id.clone(),
-                                    title: r.meta.name.clone(),
-                                    subtitle: Some(format!(
-                                        "{} msgs • {}",
-                                        r.meta.message_count,
-                                        r.meta.updated_at.format("%Y-%m-%d %H:%M")
-                                    )),
-                                })
-                                .collect(),
-                            Err(e) => {
-                                app.add_error(format!("Search failed: {}", e));
-                                Vec::new()
-                            }
-                        }
-                    } else {
-                        app.add_error("Session store unavailable");
-                        Vec::new()
-                    };
+                    let items = core
+                        .search_sessions(&query, 20)
+                        .into_iter()
+                        .map(|r| PickerItem {
+                            id: r.meta.id.clone(),
+                            title: r.meta.name.clone(),
+                            subtitle: Some(format!(
+                                "{} msgs • {}",
+                                r.meta.message_count,
+                                r.meta.updated_at.format("%Y-%m-%d %H:%M")
+                            )),
+                        })
+                        .collect();
                     app.set_overlay_items(items);
                 }
                 None => {}
@@ -767,108 +535,9 @@ fn truncate(text: &str, max: usize) -> &str {
     &text[..end]
 }
 
-/// Derive a chat title from the first user message.
-fn title_from(text: &str) -> String {
-    let one_line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one_line.is_empty() {
-        return "New chat".to_string();
-    }
-    let truncated: String = one_line.chars().take(60).collect();
-    if one_line.chars().count() > 60 {
-        format!("{}…", truncated)
-    } else {
-        truncated
-    }
-}
-
-/// Create a new session and point the app at it.
-fn start_session(
-    store: Option<&mut SessionStore>,
-    app: &mut App,
-    persisted_count: &mut usize,
-    title: &str,
-    model: &str,
-) -> Option<String> {
-    let store = store?;
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|p| p.to_string_lossy().to_string());
-    let provider = model.split('/').next().map(|s| s.to_string());
-    let config = SessionConfig {
-        agent_mode: Some(app.chat_picker.mode.as_str().to_string()),
-        ..Default::default()
-    };
-    let id = store
-        .create_with_config(
-            title,
-            Some(model),
-            provider.as_deref(),
-            cwd.as_deref(),
-            &config,
-        )
-        .ok()?;
-    app.current_session_id = Some(id.clone());
-    *persisted_count = 0;
-    Some(id)
-}
-
-/// Write the messages produced by a turn into the session database.
-fn persist_turn(
-    store: Option<&mut SessionStore>,
-    persisted_count: &mut usize,
-    app: &mut App,
-    messages: &[ChatMessage],
-    model: &str,
-    pricing: &std::collections::HashMap<String, ModelPricing>,
-    usage: Option<TokenUsage>,
-) {
-    let Some(store) = store else { return };
-    let Some(session_id) = app.current_session_id.clone() else {
-        return;
-    };
-
-    match store.sync_messages(&session_id, messages, *persisted_count) {
-        Ok(stored) => *persisted_count = stored,
-        Err(e) => tracing::warn!("failed to persist messages: {}", e),
-    }
-
-    // Fold the token counters into the session config.
-    if let Ok(mut config) = store.get_config(&session_id) {
-        if let Some(u) = usage {
-            config.tokens_in += u.prompt;
-            config.tokens_out += u.completion;
-        }
-        config.cost_usd = cost_for(
-            pricing,
-            model,
-            TokenUsage::new(config.tokens_in, config.tokens_out),
-        );
-        if let Err(e) = store.set_config(&session_id, &config) {
-            tracing::warn!("failed to update session config: {}", e);
-        }
-        app.token_count = (config.tokens_in + config.tokens_out) as usize;
-    }
-}
-
-/// Cost in USD for the given usage, when the model has a configured price.
-fn cost_for(
-    pricing: &std::collections::HashMap<String, ModelPricing>,
-    model: &str,
-    usage: TokenUsage,
-) -> Option<f64> {
-    let price = ModelPricing::lookup(pricing, model)?;
-    Some(
-        (usage.prompt as f64 / 1_000_000.0) * price.input
-            + (usage.completion as f64 / 1_000_000.0) * price.output,
-    )
-}
-
-/// Build the chat-picker rows from the session store.
-fn load_chat_sessions(store: &SessionStore) -> Vec<ChatSession> {
-    let Ok(sessions) = store.list(200) else {
-        return Vec::new();
-    };
-    sessions
+/// Build the chat-picker rows from the core's session list.
+fn load_chat_sessions(core: &CoreApp) -> Vec<ChatSession> {
+    core.list_sessions(200)
         .into_iter()
         .map(|s| ChatSession {
             id: s.id.clone(),
@@ -887,42 +556,6 @@ fn load_chat_sessions(store: &SessionStore) -> Vec<ChatSession> {
         .collect()
 }
 
-fn parse_autonomy(s: &str) -> AutonomyLevel {
-    match s.to_lowercase().as_str() {
-        "ask" => AutonomyLevel::Ask,
-        "read_only" | "readonly" => AutonomyLevel::ReadOnly,
-        "yolo" => AutonomyLevel::Yolo,
-        "god" => AutonomyLevel::God,
-        _ => AutonomyLevel::ReadOnly,
-    }
-}
-
-/// Build a persona from CLI args or config.
-fn build_persona(args: &Args, cfg: &Config) -> Option<okc_reasoning::persona::Persona> {
-    let persona_name = args.persona.as_ref().or(cfg.default_persona.as_ref())?;
-
-    // Check config-defined personas first
-    if let Some(pc) = cfg.personas.get(persona_name) {
-        return Some(okc_reasoning::persona::Persona::from_config(
-            persona_name,
-            pc,
-        ));
-    }
-
-    // Fall back to built-in personas
-    okc_reasoning::persona::builtin_persona_prompt(persona_name).map(|prompt| {
-        okc_reasoning::persona::Persona {
-            name: Some(persona_name.clone()),
-            system_prompt: prompt,
-            allowed_tools: std::collections::HashSet::new(),
-            model_override: None,
-            temperature: None,
-            max_iterations: None,
-            can_delegate: true,
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -935,45 +568,6 @@ mod tests {
         assert_eq!(truncate(text, 2), "é");
         assert_eq!(truncate(text, 99), "éé");
         assert_eq!(truncate("abc", 2), "ab");
-    }
-
-    #[test]
-    fn title_from_flattens_and_truncates() {
-        assert_eq!(title_from("hello   world"), "hello world");
-        assert_eq!(title_from(""), "New chat");
-        let long = "x".repeat(100);
-        let title = title_from(&long);
-        assert_eq!(title.chars().count(), 61);
-        assert!(title.ends_with('…'));
-    }
-
-    #[test]
-    fn cost_is_unknown_without_a_price() {
-        let pricing = std::collections::HashMap::new();
-        assert_eq!(
-            cost_for(&pricing, "minimax/MiniMax-M3", TokenUsage::new(1000, 1000)),
-            None
-        );
-    }
-
-    #[test]
-    fn cost_uses_the_configured_price() {
-        let mut pricing = std::collections::HashMap::new();
-        pricing.insert(
-            "MiniMax-M3".to_string(),
-            ModelPricing {
-                input: 1.0,
-                output: 2.0,
-            },
-        );
-        // 1M input at $1 and 1M output at $2.
-        let cost = cost_for(
-            &pricing,
-            "minimax/MiniMax-M3",
-            TokenUsage::new(1_000_000, 1_000_000),
-        )
-        .unwrap();
-        assert!((cost - 3.0).abs() < f64::EPSILON);
     }
 
     #[test]
