@@ -132,6 +132,9 @@ pub struct Orchestrator {
     /// Extra tool names classified as mutating (extends
     /// `okc_core::is_mutation_tool`).
     pub mutation_extra: std::collections::HashSet<String>,
+    /// Session this turn belongs to — audit events carry it so the trail
+    /// can be queried per session.
+    pub session_id: Option<String>,
 }
 
 impl Orchestrator {
@@ -160,6 +163,7 @@ impl Orchestrator {
             persona: None,
             confirm_tx: None,
             mutation_extra: std::collections::HashSet::new(),
+            session_id: None,
         }
     }
 
@@ -197,6 +201,14 @@ impl Orchestrator {
 
         // Append user message
         messages.push(ChatMessage::user(user_input));
+
+        // Record the request in the audit trail (when bound to a session).
+        if self.session_id.is_some() {
+            self.publish(Event::UserMessage {
+                session_id: self.session_id(),
+                content: user_input.to_string(),
+            });
+        }
 
         self.log_reasoning(ReasoningKind::Plan, format!("User: {}", user_input), None);
 
@@ -787,6 +799,14 @@ impl Orchestrator {
             arguments: call.arguments.clone(),
         };
 
+        // Record the call in the audit trail (when bound to a session).
+        if self.session_id.is_some() {
+            self.publish(Event::ToolCall {
+                session_id: self.session_id(),
+                call: tool_call.clone(),
+            });
+        }
+
         let start = std::time::Instant::now();
         let (success, content, is_error) = match self.tools.execute_tool(&tool_call).await {
             Ok(outcome) => {
@@ -811,7 +831,7 @@ impl Orchestrator {
         };
 
         self.publish(Event::ToolResult {
-            session_id: Id::new(),
+            session_id: self.session_id(),
             result: ToolOutcome {
                 call_id: tool_call.id,
                 success,
@@ -848,13 +868,19 @@ impl Orchestrator {
             content,
         });
         self.publish(Event::Reasoning {
-            session_id: Id::new(),
+            session_id: self.session_id(),
             step,
         });
     }
 
     fn publish(&self, event: Event) {
         self.event_bus.publish(event);
+    }
+
+    /// The session this turn belongs to, or a throwaway id when the agent
+    /// is not bound to a session.
+    fn session_id(&self) -> Id {
+        self.session_id.clone().map(Id).unwrap_or_else(Id::new)
     }
 }
 

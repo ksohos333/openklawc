@@ -88,13 +88,16 @@ impl Args {
             autonomy: self.autonomy.clone().map(|a| parse_autonomy(&a)),
             persona: self.persona.clone(),
             start_mcp: !self.no_mcp,
+            audit_db: None,
         }
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    // Structured JSON logs on stderr — consumable by CI, the daemon and
+    // log shippers.
+    tracing_subscriber::fmt().json().init();
 
     let args = Args::parse(std::env::args().skip(1));
 
@@ -133,6 +136,9 @@ async fn run_headless(args: &Args, prompt: String) -> Result<()> {
     // Headless runs never attach an approval channel, so any tool call that
     // needs confirmation is denied — by construction, not by accident.
     let session_id = core.create_session(&title_from(&prompt), "build");
+    if let Some(id) = &session_id {
+        core.bind_session(id);
+    }
     let mut persisted: usize = 0;
 
     let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -346,7 +352,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, args: &A
                         let title = title_from(&query);
                         let mode = app.chat_picker.mode.as_str().to_string();
                         if let Some(id) = core.create_session(&title, &mode) {
-                            app.current_session_id = Some(id);
+                            app.current_session_id = Some(id.clone());
+                            core.bind_session(&id);
                             persisted_count = 0;
                         }
                     }
@@ -430,6 +437,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, args: &A
                                 .collect();
                             app.set_transcript(&transcript);
                             app.current_session_id = Some(id.clone());
+                            core.bind_session(&id);
                             persisted_count = persisted.len();
                             app.token_count = core.session_tokens(&id) as usize;
                             app.add_system(format!(
@@ -514,6 +522,38 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, args: &A
                         })
                         .collect();
                     app.set_overlay_items(items);
+                }
+                Some(AppEvent::AuditTrail) => {
+                    match app.current_session_id.clone() {
+                        Some(sid) => {
+                            let steps = core.reasoning_trail(&sid, 25);
+                            let events = core.audit_trail(&sid, 25);
+                            if steps.is_empty() && events.is_empty() {
+                                app.add_system("No audit trail for this session yet.");
+                            }
+                            for step in steps {
+                                let decision = step
+                                    .decision_json
+                                    .as_deref()
+                                    .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+                                    .and_then(|v| {
+                                        v.get("confidence")
+                                            .and_then(|c| c.as_str())
+                                            .map(|c| format!(" confidence={}", c))
+                                    })
+                                    .unwrap_or_default();
+                                let content: String = step.content.chars().take(120).collect();
+                                app.add_system(format!(
+                                    "[reason] {} {}{}",
+                                    step.kind, content, decision
+                                ));
+                            }
+                            for event in events {
+                                app.add_system(format!("[audit] {} {}", event.kind, event.payload));
+                            }
+                        }
+                        None => app.add_error("No session yet — start a chat first."),
+                    }
                 }
                 None => {}
             }

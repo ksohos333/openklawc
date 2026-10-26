@@ -213,6 +213,33 @@ Denials come back to the model as ordinary tool errors naming the rule
 When a persona restricts its `allowed_tools`, that restriction is enforced
 at run time too — not just hidden from the prompt.
 
+## Audit Trail
+
+Every session writes an audit trail to the same SQLite database as the
+chats (`~/.local/share/openklawc/sessions.db`):
+
+- **`audit_events`** — one row per event: user messages, tool calls, tool
+  results, file mutations, command executions, autonomy changes
+- **`reasoning_steps`** — the decision trail: every reasoning step with its
+  kind, content and decision metadata (confidence, chosen approach,
+  alternatives, key trade-off)
+
+Inspect it in the TUI with `/audit` (shows the current session), or query
+it directly:
+
+```bash
+sqlite3 ~/.local/share/openklawc/sessions.db \
+  "SELECT ts, kind FROM audit_events WHERE session_id='<id>' ORDER BY event_id"
+sqlite3 ~/.local/share/openklawc/sessions.db \
+  "SELECT kind, content, decision_json FROM reasoning_steps WHERE session_id='<id>'"
+```
+
+The database carries a schema version (`PRAGMA user_version`); migrations
+back the file up beside the original before touching it
+(`sessions.db.bak-pre-vN`). Deleting a chat also deletes its audit rows.
+
+Logs are structured JSON on stderr (`RUST_LOG` controls the level).
+
 ## Agent Loop
 
 The agent loop (Hermes-inspired):

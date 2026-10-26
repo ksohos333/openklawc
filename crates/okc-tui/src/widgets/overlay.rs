@@ -168,8 +168,10 @@ Commands
   /clear              Clear scrollback
   /models             Switch model
   /sessions           Browse sessions
+  /chats              Open the chat picker
   /autonomy <level>   Set autonomy (ask/read_only/yolo/god)
   /search <query>     Search conversation history
+  /audit              Show this session's audit trail
   /reasoning          Toggle reasoning panel
 "
     .to_string();

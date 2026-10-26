@@ -10,24 +10,91 @@ use rusqlite::{params, Connection};
 
 pub struct SessionStore {
     conn: Connection,
+    path: std::path::PathBuf,
 }
 
+/// Current schema version. Bump this AND add a migration arm in
+/// `init_schema` whenever the schema changes — `CREATE TABLE IF NOT EXISTS`
+/// alone is a silent no-op on existing databases.
+const SCHEMA_VERSION: i64 = 1;
+
 impl SessionStore {
-    /// Open the session database. Creates tables if they don't exist.
+    /// Open the session database at the default location.
     pub fn new() -> Result<Self> {
-        let dir = dirs::data_dir()
-            .ok_or_else(|| anyhow::anyhow!("no data dir"))?
-            .join("openklawc");
-        std::fs::create_dir_all(&dir)?;
-        let db_path = dir.join("sessions.db");
-        let conn = Connection::open(&db_path)
-            .with_context(|| format!("opening session db at {:?}", db_path))?;
-        let store = Self { conn };
+        Self::open(&Self::default_path())
+    }
+
+    /// Default database path: `<data dir>/openklawc/sessions.db`.
+    pub fn default_path() -> std::path::PathBuf {
+        dirs::data_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("openklawc")
+            .join("sessions.db")
+    }
+
+    /// Open (or create) a session database at an explicit path. Creates and
+    /// migrates the schema as needed; a pre-existing database is backed up
+    /// beside the original before any migration touches it.
+    pub fn open(path: &std::path::Path) -> Result<Self> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let conn = Connection::open(path)
+            .with_context(|| format!("opening session db at {}", path.display()))?;
+        // The audit subscriber writes on its own connection; a busy timeout
+        // keeps concurrent writers from failing with SQLITE_BUSY.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let store = Self {
+            conn,
+            path: path.to_path_buf(),
+        };
         store.init_schema()?;
         Ok(store)
     }
 
     fn init_schema(&self) -> Result<()> {
+        let version: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .context("reading schema version")?;
+
+        if version == 0 {
+            // Version 0 means "fresh database" OR "pre-versioning legacy
+            // database". A legacy db already has tables — back it up before
+            // this migration adds the audit tables.
+            let legacy: bool = self.conn.query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='sessions'",
+                [],
+                |r| r.get(0),
+            )?;
+            if legacy {
+                let backup = self.path.with_extension("db.bak-pre-v1");
+                std::fs::copy(&self.path, &backup).with_context(|| {
+                    format!(
+                        "backing up {} before migrating to v{}",
+                        self.path.display(),
+                        SCHEMA_VERSION
+                    )
+                })?;
+                tracing::info!(
+                    "backed up pre-v1 session db to {}",
+                    backup.display()
+                );
+            }
+        } else if version < SCHEMA_VERSION {
+            // Future migrations go here — same backup-first rule.
+            let backup = self
+                .path
+                .with_extension(format!("db.bak-pre-v{}", SCHEMA_VERSION));
+            std::fs::copy(&self.path, &backup).with_context(|| {
+                format!(
+                    "backing up {} before migrating to v{}",
+                    self.path.display(),
+                    SCHEMA_VERSION
+                )
+            })?;
+        }
+
         self.conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS sessions (
@@ -85,8 +152,22 @@ impl SessionStore {
                 INSERT INTO search(search, rowid, content, session_id)
                 VALUES ('delete', old.rowid, old.content, old.session_id);
             END;
+
+            CREATE TABLE IF NOT EXISTS audit_events (
+                event_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts           TEXT NOT NULL,
+                session_id   TEXT,
+                kind         TEXT NOT NULL,
+                payload_json TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_session ON audit_events(session_id);
             "#,
         )?;
+
+        if version != SCHEMA_VERSION {
+            self.conn
+                .pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        }
         Ok(())
     }
 
@@ -328,12 +409,17 @@ impl SessionStore {
         Ok(sessions)
     }
 
-    /// Delete a session and all its messages.
+    /// Delete a session and all its messages, reasoning steps and audit
+    /// events.
     pub fn delete(&mut self, id: &str) -> Result<()> {
         self.conn
             .execute("DELETE FROM messages WHERE session_id = ?1", params![id])?;
         self.conn.execute(
             "DELETE FROM reasoning_steps WHERE session_id = ?1",
+            params![id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM audit_events WHERE session_id = ?1",
             params![id],
         )?;
         self.conn.execute(
@@ -343,6 +429,93 @@ impl SessionStore {
         self.conn
             .execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
         Ok(())
+    }
+
+    /// Append an audit event — one who/what/when row from the event bus.
+    pub fn append_audit(
+        &self,
+        ts: &str,
+        session_id: Option<&str>,
+        kind: &str,
+        payload: &serde_json::Value,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO audit_events (ts, session_id, kind, payload_json) VALUES (?1, ?2, ?3, ?4)",
+            params![ts, session_id, kind, payload.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Recent audit events for a session, newest first.
+    pub fn audit_for_session(&self, session_id: &str, limit: usize) -> Result<Vec<AuditEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ts, kind, payload_json FROM audit_events \
+             WHERE session_id = ?1 ORDER BY event_id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![session_id, limit], |r| {
+            Ok(AuditEvent {
+                ts: r.get(0)?,
+                kind: r.get(1)?,
+                payload: serde_json::from_str(&r.get::<_, String>(2)?)
+                    .unwrap_or(serde_json::Value::Null),
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Persist one reasoning step — the decision audit trail.
+    pub fn append_reasoning_step(
+        &self,
+        session_id: &str,
+        step: &okc_core::ReasoningStep,
+    ) -> Result<()> {
+        let next: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(step_id), 0) + 1 FROM reasoning_steps WHERE session_id = ?1",
+            params![session_id],
+            |r| r.get(0),
+        )?;
+        let decision = if step.decision.is_default() {
+            None
+        } else {
+            serde_json::to_string(&step.decision).ok()
+        };
+        self.conn.execute(
+            "INSERT INTO reasoning_steps (session_id, step_id, kind, content, decision_json, timestamp) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                session_id,
+                next,
+                format!("{:?}", step.kind),
+                step.content,
+                decision,
+                step.timestamp.to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Reasoning steps for a session, oldest first.
+    pub fn reasoning_for_session(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ReasoningRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT kind, content, decision_json, timestamp FROM reasoning_steps \
+             WHERE session_id = ?1 ORDER BY step_id DESC LIMIT ?2",
+        )?;
+        let mut rows: Vec<ReasoningRow> = stmt
+            .query_map(params![session_id, limit], |r| {
+                Ok(ReasoningRow {
+                    kind: r.get(0)?,
+                    content: r.get(1)?,
+                    decision_json: r.get(2)?,
+                    timestamp: r.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.reverse();
+        Ok(rows)
     }
 
     /// Export all sessions to JSON (for backup / migration).
@@ -468,15 +641,46 @@ pub struct SearchResult {
     pub matching_content: Option<String>,
 }
 
+/// One stored audit event (who/what/when, from the event bus).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AuditEvent {
+    pub ts: String,
+    pub kind: String,
+    pub payload: serde_json::Value,
+}
+
+/// One stored reasoning step (the decision audit trail).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReasoningRow {
+    pub kind: String,
+    pub content: String,
+    pub decision_json: Option<String>,
+    pub timestamp: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn in_memory_store() -> SessionStore {
         let conn = Connection::open_in_memory().unwrap();
-        let store = SessionStore { conn };
+        let store = SessionStore {
+            conn,
+            path: std::path::PathBuf::from(":memory:"),
+        };
         store.init_schema().unwrap();
         store
+    }
+
+    /// Unique temp dir for file-backed tests.
+    fn temp_db(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "okc-session-test-{}-{}",
+            std::process::id(),
+            name
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("sessions.db")
     }
 
     #[test]
@@ -716,5 +920,146 @@ mod tests {
         let results = store.search("binary search tree", 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].meta.name, "searchable");
+    }
+
+    #[test]
+    fn open_at_a_path_sets_schema_version() {
+        let path = temp_db("version");
+        {
+            let store = SessionStore::open(&path).unwrap();
+            let v: i64 = store
+                .conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(v, SCHEMA_VERSION);
+        }
+        // Reopening an already-migrated db must be a no-op (no backup file).
+        let _ = SessionStore::open(&path).unwrap();
+        assert!(!path.with_extension("db.bak-pre-v1").exists());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn legacy_database_is_backed_up_before_migration() {
+        let path = temp_db("legacy");
+
+        // Hand-build a legacy (pre-versioning) database with data.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL, model TEXT,
+                    provider TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    cwd TEXT, config_json TEXT
+                );
+                INSERT INTO sessions VALUES ('s1', 'legacy chat', NULL, NULL,
+                    '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', NULL, NULL);",
+            )
+            .unwrap();
+        }
+
+        let store = SessionStore::open(&path).unwrap();
+        let backup = path.with_extension("db.bak-pre-v1");
+        assert!(backup.exists(), "legacy db must be backed up");
+
+        // Data survived, schema version stamped.
+        assert_eq!(store.list(10).unwrap().len(), 1);
+        let v: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&backup);
+    }
+
+    #[test]
+    fn audit_events_round_trip() {
+        let store = in_memory_store();
+        let ts = "2026-10-26T12:00:00Z";
+        store
+            .append_audit(ts, Some("s1"), "ToolResult", &serde_json::json!({"name": "read_file"}))
+            .unwrap();
+        store
+            .append_audit(ts, Some("s1"), "FileMutation", &serde_json::json!({"path": "a.rs"}))
+            .unwrap();
+        store
+            .append_audit(ts, None, "AutonomyChanged", &serde_json::json!({"level": "Yolo"}))
+            .unwrap();
+
+        let events = store.audit_for_session("s1", 10).unwrap();
+        assert_eq!(events.len(), 2, "session-less events excluded: {:?}", events);
+        // Newest first.
+        assert_eq!(events[0].kind, "FileMutation");
+        assert_eq!(events[0].payload["path"], "a.rs");
+    }
+
+    #[test]
+    fn reasoning_steps_round_trip_with_decisions() {
+        let store = in_memory_store();
+        let step = okc_core::ReasoningStep {
+            timestamp: Utc::now(),
+            kind: okc_core::ReasoningKind::Decide,
+            content: "I will run cargo test".into(),
+            tool_call: None,
+            tool_result: None,
+            decision: okc_core::DecisionMetadata {
+                confidence: Some("high".into()),
+                chosen_approach: Some("test-first".into()),
+                alternatives: Some(vec!["read-code-first".into()]),
+                key_tradeoff: Some("speed".into()),
+                is_backtrack: false,
+                iteration: 2,
+            },
+        };
+        store.append_reasoning_step("s1", &step).unwrap();
+        store
+            .append_reasoning_step(
+                "s1",
+                &okc_core::ReasoningStep {
+                    timestamp: Utc::now(),
+                    kind: okc_core::ReasoningKind::Plan,
+                    content: "plain step".into(),
+                    tool_call: None,
+                    tool_result: None,
+                    decision: okc_core::DecisionMetadata::default(),
+                },
+            )
+            .unwrap();
+
+        let rows = store.reasoning_for_session("s1", 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        // Oldest first.
+        assert_eq!(rows[0].kind, "Decide");
+        assert_eq!(rows[1].kind, "Plan");
+        let decision: serde_json::Value =
+            serde_json::from_str(&rows[0].decision_json.clone().unwrap()).unwrap();
+        assert_eq!(decision["confidence"], "high");
+        assert_eq!(decision["iteration"], 2);
+        // The default-decision step stores no blob.
+        assert!(rows[1].decision_json.is_none());
+    }
+
+    #[test]
+    fn delete_cascades_to_audit_and_reasoning() {
+        let store = in_memory_store();
+        let step = okc_core::ReasoningStep {
+            timestamp: Utc::now(),
+            kind: okc_core::ReasoningKind::Plan,
+            content: "x".into(),
+            tool_call: None,
+            tool_result: None,
+            decision: okc_core::DecisionMetadata::default(),
+        };
+        store.append_audit("t", Some("s1"), "Log", &serde_json::json!({})).unwrap();
+        store.append_reasoning_step("s1", &step).unwrap();
+
+        let mut store = store;
+        // 's1' has no sessions row; delete() is by-session-id and cleans
+        // the dependents regardless.
+        store.delete("s1").unwrap();
+        assert!(store.audit_for_session("s1", 10).unwrap().is_empty());
+        assert!(store.reasoning_for_session("s1", 10).unwrap().is_empty());
     }
 }

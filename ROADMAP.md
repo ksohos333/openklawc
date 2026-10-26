@@ -158,9 +158,12 @@ A roadmap to evolve OpenKLawc from its current v0.2 foundation into a robust, po
   - Require confirmation for files matching `.env`, `*.key`, `secrets.*`
   - Rate-limit expensive operations (API calls, large file writes)
 - [ ] **Observability & logging**
-  - Structured JSON logs of every decision, tool call, and reasoning step
-  - Export to OpenTelemetry for external monitoring
-  - Decision audit trail: why did the agent choose this path?
+  - [x] Structured JSON logs (tracing, stderr)
+  - [x] SQLite audit trail — `audit_events` + `reasoning_steps` per session
+  - [x] Schema migrations with `PRAGMA user_version` and pre-migration backups
+  - [x] `/audit` command in the TUI
+  - [ ] Export to OpenTelemetry for external monitoring
+  - [ ] Decision audit trail UI: why did the agent choose this path?
 - [ ] **Integration modes**
   - **TUI** (current) — interactive terminal UI
   - **Headless** — `openklawc -p "..."` for CI/CD pipelines

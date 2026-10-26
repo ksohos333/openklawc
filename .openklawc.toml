@@ -16,6 +16,14 @@ base_url = "http://localhost:11434/v1"
 api_key = ""
 models = ["qwen3"]
 
+# Z.AI GLM coding plan (OpenAI-compatible). The key stays in the shared
+# key file — this project config is tracked in git.
+[provider.zai]
+api = "openai"
+base_url = "https://api.z.ai/api/coding/paas/v4"
+api_key = "{file:~/.config/opencode/keys/zai.key}"
+models = ["glm-5.3", "glm-5.2"]
+
 # Rust-native MCP servers (built into this workspace)
 [mcp.web_research]
 command = "./target/release/mcp-web-research"

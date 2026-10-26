@@ -51,6 +51,7 @@ async fn boots_and_runs_one_turn_with_mock_provider() {
             autonomy: Some(AutonomyLevel::Yolo),
             persona: None,
             start_mcp: false,
+            audit_db: None,
         },
         Some(registry),
     )
@@ -95,8 +96,7 @@ async fn unknown_explicit_model_is_a_boot_error() {
 }
 
 #[tokio::test]
-async fn policy_is_active_at_the_booted_executor_seam() {
-    let mut registry = ProviderRegistry::new();
+async fn policy_is_active_at_the_booted_executor_seam() {    let mut registry = ProviderRegistry::new();
     registry.register("mock", Arc::new(EchoProvider), vec!["echo-1".to_string()]);
 
     // God mode: the most permissive autonomy. Policy must still hold.
@@ -112,7 +112,7 @@ async fn policy_is_active_at_the_booted_executor_seam() {
     .await
     .expect("boot");
 
-    use okc_core::{ToolCall, ToolExecutor};
+    use okc_core::ToolCall;
 
     // Protected path — denied even in god mode.
     let call = ToolCall {
@@ -136,4 +136,52 @@ async fn policy_is_active_at_the_booted_executor_seam() {
     let out = app.tools.execute_tool(&call).await.unwrap();
     assert!(!out.success, "out-of-root read must be denied");
     assert!(out.error.unwrap().contains("allowed roots"));
+}
+
+#[tokio::test]
+async fn audit_trail_records_events_for_the_bound_session() {
+    let dir = std::env::temp_dir().join(format!("okc-app-audit-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let audit_db = dir.join("audit.db");
+    let _ = std::fs::remove_file(&audit_db);
+
+    let mut registry = ProviderRegistry::new();
+    registry.register("mock", Arc::new(EchoProvider), vec!["echo-1".to_string()]);
+
+    let (app, _boot) = App::boot_with(
+        AppOptions {
+            model: Some("mock/echo-1".to_string()),
+            start_mcp: false,
+            audit_db: Some(audit_db.clone()),
+            ..Default::default()
+        },
+        Some(registry),
+    )
+    .await
+    .expect("boot");
+
+    // An event on the bus must land in the audit trail.
+    app.event_bus.publish(okc_core::Event::UserMessage {
+        session_id: okc_core::Id("sess-audit-1".to_string()),
+        content: "audit probe".to_string(),
+    });
+
+    // The subscriber runs on its own thread — poll briefly.
+    let mut events = Vec::new();
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let store = okc_session::SessionStore::open(&audit_db).expect("open audit db");
+        events = store.audit_for_session("sess-audit-1", 10).unwrap();
+        if !events.is_empty() {
+            break;
+        }
+    }
+    assert!(
+        !events.is_empty(),
+        "audit subscriber must record the event"
+    );
+    assert_eq!(events[0].kind, "UserMessage");
+
+    let _ = std::fs::remove_file(&audit_db);
+    let _ = std::fs::remove_dir(&dir);
 }

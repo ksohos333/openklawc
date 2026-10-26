@@ -550,6 +550,7 @@ impl App {
                 ));
                 None
             }
+            "/audit" | "/trail" => Some(AppEvent::AuditTrail),
             "/quit" | "/q" => Some(AppEvent::Quit),
             _ => {
                 self.add_error(format!(
@@ -1014,4 +1015,7 @@ pub enum AppEvent {
     DeleteSession(String),
     /// Answer a pending tool approval: true allows the call.
     ConfirmTool(bool),
+    /// Show the audit trail (events + reasoning steps) of the current
+    /// session.
+    AuditTrail,
 }

@@ -97,6 +97,9 @@ pub struct Agent {
     /// MCP tools). Extends `okc_core::is_mutation_tool`, so these require
     /// approval outside `yolo`/`god`.
     pub mutation_extra: std::collections::HashSet<String>,
+    /// Session this agent is bound to — used to attribute audit events
+    /// (user messages, reasoning steps) to a session.
+    pub session_id: Option<String>,
 }
 
 impl Agent {
@@ -124,6 +127,7 @@ impl Agent {
             persona: None,
             confirm_tx: None,
             mutation_extra: std::collections::HashSet::new(),
+            session_id: None,
         }
     }
 
@@ -176,6 +180,7 @@ impl Agent {
             persona: self.persona.clone(),
             confirm_tx: self.confirm_tx.clone(),
             mutation_extra: self.mutation_extra.clone(),
+            session_id: self.session_id.clone(),
         }
     }
 
@@ -202,6 +207,7 @@ impl Agent {
             persona: self.persona.clone(),
             confirm_tx: self.confirm_tx.clone(),
             mutation_extra: self.mutation_extra.clone(),
+            session_id: self.session_id.clone(),
         };
 
         let new_messages = orch.run_turn(user_input, messages).await;

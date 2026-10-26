@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 use okc_config::{Config, ModelPricing};
-use okc_core::{AutonomyLevel, ChatMessage, EventBus, TokenUsage, ToolCall, ToolExecutor, ToolOutcome, ToolSchema};
+use okc_core::{AutonomyLevel, ChatMessage, Event, EventBus, TokenUsage, ToolCall, ToolExecutor, ToolOutcome, ToolSchema};
 use okc_llm::{LlmClient, ProviderRegistry};
 use okc_mcp::McpRegistry;
 use okc_policy::PolicyExecutor;
@@ -37,6 +37,9 @@ pub struct AppOptions {
     pub persona: Option<String>,
     /// Start MCP servers (false for `--no-mcp`).
     pub start_mcp: bool,
+    /// Where the audit trail is written. `None` uses the session database
+    /// next to the app's data; tests point this at a temp file.
+    pub audit_db: Option<std::path::PathBuf>,
 }
 
 impl Default for AppOptions {
@@ -46,6 +49,7 @@ impl Default for AppOptions {
             autonomy: None,
             persona: None,
             start_mcp: true,
+            audit_db: None,
         }
     }
 }
@@ -90,6 +94,10 @@ impl App {
         registry: Option<ProviderRegistry>,
     ) -> Result<(App, BootInfo)> {
         let cfg = Config::load_default().unwrap_or_default();
+        let audit_db = opts
+            .audit_db
+            .clone()
+            .unwrap_or_else(SessionStore::default_path);
 
         // Environment overrides — highest precedence, above config files.
         let model_req = std::env::var("OKC_MODEL").ok().or(opts.model);
@@ -184,6 +192,47 @@ impl App {
         // ─── Sessions ─────────────────────────────────────────────────────
         let session_store = SessionStore::new().ok();
 
+        // ─── Audit trail ─────────────────────────────────────────────────
+        // Every event on the bus is written to the session database: tool
+        // calls and results, file mutations, command executions, user
+        // messages, reasoning steps. The subscriber runs on its own thread
+        // so a slow disk never blocks the agent loop.
+        {
+            let mut rx = event_bus.subscribe();
+            std::thread::Builder::new()
+                .name("okc-audit".to_string())
+                .spawn(move || {
+                    let Ok(store) = SessionStore::open(&audit_db) else {
+                        return;
+                    };
+                    while let Ok(event) = rx.blocking_recv() {
+                        let ts = chrono::Utc::now().to_rfc3339();
+                        match &event {
+                            Event::Reasoning { session_id, step } => {
+                                let _ = store.append_reasoning_step(&session_id.0, step);
+                            }
+                            Event::UserMessage {
+                                session_id,
+                                content,
+                            } => {
+                                let _ = store.append_audit(
+                                    &ts,
+                                    Some(&session_id.0),
+                                    "UserMessage",
+                                    &serde_json::json!({ "content": content }),
+                                );
+                            }
+                            other => {
+                                let (kind, session_id, payload) = flatten_event(other);
+                                let _ =
+                                    store.append_audit(&ts, session_id.as_deref(), kind, &payload);
+                            }
+                        }
+                    }
+                })
+                .ok();
+        }
+
         Ok((
             App {
                 cfg,
@@ -223,6 +272,32 @@ impl App {
         self.agent.autonomy = level;
         self.event_bus
             .publish(okc_core::Event::AutonomyChanged { level });
+    }
+
+    /// Bind the agent to a session so its user messages and reasoning steps
+    /// land in that session's audit trail.
+    pub fn bind_session(&mut self, session_id: &str) {
+        self.agent.session_id = Some(session_id.to_string());
+    }
+
+    /// Recent audit events for a session, newest first.
+    pub fn audit_trail(&self, session_id: &str, limit: usize) -> Vec<okc_session::AuditEvent> {
+        self.session_store
+            .as_ref()
+            .and_then(|s| s.audit_for_session(session_id, limit).ok())
+            .unwrap_or_default()
+    }
+
+    /// Reasoning steps for a session, oldest first — the decision trail.
+    pub fn reasoning_trail(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Vec<okc_session::ReasoningRow> {
+        self.session_store
+            .as_ref()
+            .and_then(|s| s.reasoning_for_session(session_id, limit).ok())
+            .unwrap_or_default()
     }
 
     /// Attach an approval channel (the TUI's confirm queue). Without one,
@@ -353,6 +428,41 @@ impl App {
             None => false,
         }
     }
+}
+
+/// Split an event into (kind, session id, payload) for the audit table.
+fn flatten_event(event: &Event) -> (&'static str, Option<String>, serde_json::Value) {
+    let kind = match event {
+        Event::UserMessage { .. } => "UserMessage",
+        Event::AssistantMessage { .. } => "AssistantMessage",
+        Event::Reasoning { .. } => "Reasoning",
+        Event::ToolCall { .. } => "ToolCall",
+        Event::ToolResult { .. } => "ToolResult",
+        Event::AutonomyChanged { .. } => "AutonomyChanged",
+        Event::FileMutation { .. } => "FileMutation",
+        Event::CommandExecuted { .. } => "CommandExecuted",
+        Event::SessionCreated { .. } => "SessionCreated",
+        Event::SessionLoaded { .. } => "SessionLoaded",
+        Event::SessionSaved { .. } => "SessionSaved",
+        Event::Error { .. } => "Error",
+        Event::Log { .. } => "Log",
+    };
+    let session_id = match event {
+        Event::UserMessage { session_id, .. }
+        | Event::AssistantMessage { session_id, .. }
+        | Event::Reasoning { session_id, .. }
+        | Event::ToolCall { session_id, .. }
+        | Event::ToolResult { session_id, .. }
+        | Event::SessionCreated { session_id, .. }
+        | Event::SessionLoaded { session_id, .. }
+        | Event::SessionSaved { session_id, .. } => Some(session_id.0.clone()),
+        _ => None,
+    };
+    (
+        kind,
+        session_id,
+        serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+    )
 }
 
 /// Resolve which model to use.
@@ -539,5 +649,33 @@ mod tests {
     fn tool_config_defaults_to_everything_enabled() {
         let cfg = okc_config::ToolConfig::default();
         assert!(cfg.shell && cfg.file_read && cfg.file_write && cfg.git && cfg.search);
+    }
+
+    #[test]
+    fn flatten_event_extracts_kind_and_session() {
+        let event = Event::ToolResult {
+            session_id: okc_core::Id("s1".to_string()),
+            result: okc_core::ToolOutcome {
+                call_id: okc_core::Id("c1".to_string()),
+                success: true,
+                result: serde_json::json!({"ok": true}),
+                error: None,
+                elapsed_ms: 3,
+            },
+        };
+        let (kind, session_id, payload) = flatten_event(&event);
+        assert_eq!(kind, "ToolResult");
+        assert_eq!(session_id.as_deref(), Some("s1"));
+        assert!(payload.get("ToolResult").is_some(), "payload: {}", payload);
+    }
+
+    #[test]
+    fn flatten_event_handles_session_less_events() {
+        let event = Event::AutonomyChanged {
+            level: AutonomyLevel::Yolo,
+        };
+        let (kind, session_id, _) = flatten_event(&event);
+        assert_eq!(kind, "AutonomyChanged");
+        assert!(session_id.is_none());
     }
 }
