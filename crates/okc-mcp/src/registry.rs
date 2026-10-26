@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use okc_config::McpServerConfig;
-use okc_core::{Id, ToolCall, ToolExecutor, ToolOutcome, ToolSchema};
+use okc_core::{ToolCall, ToolExecutor, ToolOutcome, ToolSchema};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -17,13 +17,31 @@ pub struct Registry {
 }
 
 impl Registry {
+    /// Start every configured MCP server.
+    ///
+    /// Bundled servers (see [`crate::bundled`]) that the configuration does
+    /// not mention are launched automatically; a configuration entry always
+    /// wins and may disable a bundled server.
     pub async fn start(mcp_configs: &HashMap<String, McpServerConfig>) -> Result<Self> {
+        let resolved = crate::bundled::resolve_configs(mcp_configs);
         let mut clients = HashMap::new();
         let mut all_tools = Vec::new();
 
-        for (name, cfg) in mcp_configs {
+        for (name, cfg) in &resolved {
+            if !cfg.enabled {
+                continue;
+            }
+            if cfg.command.trim().is_empty() {
+                warn!("MCP '{}' has no command configured — skipping", name);
+                continue;
+            }
             let args: Vec<String> = cfg.args.clone();
-            match McpClient::spawn(name, &cfg.command, &args).await {
+            let env: Vec<(String, String)> = cfg
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            match McpClient::spawn_with_env(name, &cfg.command, &args, &env).await {
                 Ok(client) => {
                     let tools = client.tools().to_vec();
                     for tool in &tools {
@@ -65,7 +83,10 @@ impl Registry {
         let mut guard = client.lock().await;
         let start = std::time::Instant::now();
 
-        match guard.call_tool_raw(&call.name, call.arguments.clone()).await {
+        match guard
+            .call_tool_raw(&call.name, call.arguments.clone())
+            .await
+        {
             Ok(result) => {
                 let elapsed = start.elapsed().as_millis() as u64;
                 Ok(ToolOutcome {

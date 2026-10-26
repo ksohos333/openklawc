@@ -1,7 +1,15 @@
 # Project-local openklawc config.
 # This is merged on top of ~/.config/openklawc/config.toml
+# (deep merge: project-local wins, everything else is inherited).
 
-model = "ollama/qwen3"
+# MiniMax subscription — same key + endpoint as opencode uses here.
+model = "minimax/MiniMax-M3"
+
+[provider.minimax]
+api = "anthropic"
+base_url = "https://api.minimax.io/anthropic/v1"
+api_key = "{file:~/.config/opencode/keys/minimax-sub.key}"
+models = ["MiniMax-M3", "MiniMax-M2.7"]
 
 [provider.ollama]
 base_url = "http://localhost:11434/v1"
@@ -21,5 +29,71 @@ args = []
 command = "./target/release/mcp-legal-research"
 args = []
 
+# ─── Bundled MCP servers ──────────────────────────────────────────────────────
+# These start automatically — no entry needed. Add a table to override one;
+# `enabled = false` switches it off entirely.
+#
+# The filesystem server is sandboxed to the working directory by default.
+# [mcp.filesystem]
+# args = ["/home/bpoppa12/code", "/home/bpoppa12/projects"]
+#
+# [mcp.brave-search]
+# env = { BRAVE_API_KEY = "{file:~/.config/opencode/keys/brave.key}" }
+#
+# [mcp.playwright]
+# env = { PLAYWRIGHT_CDP_ENDPOINT = "http://127.0.0.1:9222" }
+#
+# [mcp.local-brain]
+# env = { LOCAL_BRAIN_URL = "http://127.0.0.1:9876" }
+#
+# [mcp.laya]
+# env = { LAYA_BASE_URL = "http://127.0.0.1:11435" }
+#
+# [mcp.vision]
+# env = { VISION_LOCAL_URL = "http://localhost:11434" }
+#
+# [mcp.filesystem]
+# enabled = false
+
 [autonomy]
 default_level = "yolo"
+
+[orchestrator]
+# How the model chooses tools: "auto" | "required" | "none"
+tool_choice = "auto"
+# Maximum iterations per turn
+max_iterations = 10
+# Execute independent tool calls concurrently
+parallel_tools = true
+# Retry count for transient failures
+retry_count = 3
+# Base delay (ms) for exponential backoff
+retry_delay_ms = 500
+# Summarize long tool results before feeding back
+summarize_results = true
+# Characters threshold for summarization
+summarize_threshold = 4000
+
+# ─── Token pricing ───────────────────────────────────────────────────────────
+# Cost is only shown when a price is configured for the model, so the numbers
+# are never guessed. The key may be the bare model id or the qualified one.
+#
+# [pricing."minimax/MiniMax-M3"]
+# input = 1.0    # USD per 1M input tokens
+# output = 2.0   # USD per 1M output tokens
+
+# ─── Personas ────────────────────────────────────────────────────────────────
+# Define custom agent personas. Built-ins: architect, reviewer, tester,
+# security_auditor. Custom personas override or extend built-ins.
+#
+# A persona used when --persona is not given.
+# default_persona = "my_custom"
+
+# [personas.my_custom]
+# description = "My custom reviewer"
+# system_prompt = "You are a Rust expert focused on zero-cost abstractions."
+# allowed_tools = ["read_file", "shell", "search"]
+# model = "minimax/MiniMax-M3"
+# temperature = 0.3
+# max_iterations = 5
+# can_delegate = true

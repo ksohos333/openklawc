@@ -14,4 +14,5 @@ toml = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 dirs = { workspace = true }
+shellexpand = { workspace = true }
 tracing = { workspace = true }

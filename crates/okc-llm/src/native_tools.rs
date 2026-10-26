@@ -37,6 +37,7 @@ pub fn parse_openai_message(message: &Value) -> TurnOutput {
             .unwrap_or("")
             .to_string(),
         tool_calls: Vec::new(),
+        usage: None,
     };
 
     let Some(tool_calls) = message.get("tool_calls").and_then(|v| v.as_array()) else {
@@ -48,12 +49,27 @@ pub fn parse_openai_message(message: &Value) -> TurnOutput {
         if tc_type != "function" {
             continue;
         }
-        let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let id = tc
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let func = tc.get("function").unwrap_or(&Value::Null);
-        let name = func.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let args_str = func.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
+        let name = func
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let args_str = func
+            .get("arguments")
+            .and_then(|v| v.as_str())
+            .unwrap_or("{}");
         let arguments = serde_json::from_str(args_str).unwrap_or(Value::Null);
-        out.tool_calls.push(NativeToolCall { id, name, arguments });
+        out.tool_calls.push(NativeToolCall {
+            id,
+            name,
+            arguments,
+        });
     }
 
     out
@@ -103,10 +119,22 @@ pub fn parse_anthropic_content(content: &[Value]) -> TurnOutput {
                 }
             }
             "tool_use" => {
-                let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let id = block
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let name = block
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let arguments = block.get("input").cloned().unwrap_or(Value::Null);
-                out.tool_calls.push(NativeToolCall { id, name, arguments });
+                out.tool_calls.push(NativeToolCall {
+                    id,
+                    name,
+                    arguments,
+                });
             }
             _ => {}
         }

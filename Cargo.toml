@@ -8,12 +8,19 @@ members = [
     "crates/okc-tui",
     "crates/okc-session",
     "crates/okc-reasoning",
+    "crates/okc-decision",
     "crates/okc-rag",
     "crates/okc-git",
     "crates/okc-plugin",
     "crates/mcp-web-research",
     "crates/mcp-anticonf",
     "crates/mcp-legal-research",
+    "crates/mcp-filesystem",
+    "crates/mcp-brave-search",
+    "crates/mcp-local-brain",
+    "crates/mcp-vision",
+    "crates/mcp-laya",
+    "crates/mcp-playwright",
     "crates/openklawc",
 ]
 resolver = "2"
@@ -42,7 +49,7 @@ serde_json = "1"
 toml = "0.8"
 
 # HTTP / API
-reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "gzip", "multipart"] }
 eventsource-stream = "0.2"
 bytes = "1"
 
@@ -61,6 +68,7 @@ okc-tool = { path = "crates/okc-tool" }
 okc-tui = { path = "crates/okc-tui" }
 okc-session = { path = "crates/okc-session" }
 okc-reasoning = { path = "crates/okc-reasoning" }
+okc-decision = { path = "crates/okc-decision" }
 okc-rag = { path = "crates/okc-rag" }
 okc-git = { path = "crates/okc-git" }
 okc-plugin = { path = "crates/okc-plugin" }
@@ -75,15 +83,13 @@ glob = "0.3"
 shellexpand = "3.1"
 dirs = "6"
 walkdir = "2"
-tempfile = "3"
 indexmap = "2"
 parking_lot = "0.12"
 dashmap = "6"
-once_cell = "1"
 strum = { version = "0.26", features = ["derive"] }
 
-# Process
-tokio-process = "0.2"
+# Database
+rusqlite = { version = "0.33", features = ["bundled", "chrono"] }
 
 [profile.release]
 opt-level = 3

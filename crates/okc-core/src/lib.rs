@@ -8,7 +8,6 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -49,31 +48,71 @@ impl Default for Id {
 
 /// Global event type. All subsystems produce and consume these.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// The variants differ a lot in size (a full ReasoningStep versus an Id), but
+// the enum is only ever moved around, never copied in bulk.
+#[allow(clippy::large_enum_variant)]
 pub enum Event {
     /// A user sent a message.
-    UserMessage { session_id: Id, content: String },
+    UserMessage {
+        session_id: Id,
+        content: String,
+    },
     /// An assistant produced a message (or delta).
-    AssistantMessage { session_id: Id, delta: MessageDelta },
+    AssistantMessage {
+        session_id: Id,
+        delta: MessageDelta,
+    },
     /// A reasoning step is visible to the user.
-    Reasoning { session_id: Id, step: ReasoningStep },
+    Reasoning {
+        session_id: Id,
+        step: ReasoningStep,
+    },
     /// A tool was called.
-    ToolCall { session_id: Id, call: ToolCall },
+    ToolCall {
+        session_id: Id,
+        call: ToolCall,
+    },
     /// A tool returned a result.
-    ToolResult { session_id: Id, result: ToolOutcome },
+    ToolResult {
+        session_id: Id,
+        result: ToolOutcome,
+    },
     /// The autonomy level changed.
-    AutonomyChanged { level: AutonomyLevel },
+    AutonomyChanged {
+        level: AutonomyLevel,
+    },
     /// A file was mutated (created, updated, deleted).
-    FileMutation { path: String, kind: MutationKind },
+    FileMutation {
+        path: String,
+        kind: MutationKind,
+    },
     /// A command was executed (shell, git, etc.).
-    CommandExecuted { command: String, stdout: String, stderr: String, exit_code: Option<i32> },
+    CommandExecuted {
+        command: String,
+        stdout: String,
+        stderr: String,
+        exit_code: Option<i32>,
+    },
     /// Session lifecycle.
-    SessionCreated { session_id: Id, name: String },
-    SessionLoaded { session_id: Id },
-    SessionSaved { session_id: Id },
+    SessionCreated {
+        session_id: Id,
+        name: String,
+    },
+    SessionLoaded {
+        session_id: Id,
+    },
+    SessionSaved {
+        session_id: Id,
+    },
     /// Errors.
-    Error { message: String },
+    Error {
+        message: String,
+    },
     /// Raw log line.
-    Log { level: LogLevel, message: String },
+    Log {
+        level: LogLevel,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,6 +170,51 @@ pub struct ChatMessage {
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Tool calls requested by the assistant in this turn. Kept structured so
+    /// each provider can rebuild its own wire format (Anthropic `tool_use`
+    /// blocks, OpenAI `tool_calls` array).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<NativeToolCall>>,
+    /// Tool results handed back to the model after execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_results: Option<Vec<NativeToolResult>>,
+}
+
+impl ChatMessage {
+    pub fn system(content: impl Into<String>) -> Self {
+        Self::new(Role::System, content)
+    }
+
+    pub fn user(content: impl Into<String>) -> Self {
+        Self::new(Role::User, content)
+    }
+
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self::new(Role::Assistant, content)
+    }
+
+    /// A turn carrying tool results back to the model. The provider decides
+    /// how to encode them (Anthropic: user message with `tool_result` blocks,
+    /// OpenAI: one `role: "tool"` message per result).
+    pub fn tool_results(results: Vec<NativeToolResult>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: String::new(),
+            name: None,
+            tool_calls: None,
+            tool_results: Some(results),
+        }
+    }
+
+    fn new(role: Role, content: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: content.into(),
+            name: None,
+            tool_calls: None,
+            tool_results: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,7 +297,7 @@ pub enum AutonomyLevel {
 }
 
 impl AutonomyLevel {
-    pub fn needs_confirm(&self, tool_name: &str, is_mutation: bool) -> bool {
+    pub fn needs_confirm(&self, _tool_name: &str, is_mutation: bool) -> bool {
         match self {
             AutonomyLevel::Ask => true,
             AutonomyLevel::ReadOnly => is_mutation,
@@ -230,6 +314,43 @@ impl AutonomyLevel {
     }
 }
 
+/// Tools that mutate the workspace or run arbitrary commands.
+///
+/// The autonomy gate uses this to decide whether a call needs the user's
+/// approval. It covers the built-in tools *and* the bundled MCP filesystem
+/// server, whose `edit_file` / `move_file` / `create_directory` calls are
+/// just as mutating as `write_file`.
+pub fn is_mutation_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "write_file" | "edit_file" | "create_directory" | "move_file" | "shell" | "git"
+    )
+}
+
+/// Decision metadata extracted from the LLM's reasoning output.
+/// Provides structured information about analytical choices.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DecisionMetadata {
+    /// Confidence in the chosen approach: high | medium | low
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
+    /// Identifier for the chosen approach
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chosen_approach: Option<String>,
+    /// Alternative approaches that were considered
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alternatives: Option<Vec<String>>,
+    /// The primary trade-off that decided between top options
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_tradeoff: Option<String>,
+    /// Whether this step involved a backtrack from a previous decision
+    #[serde(default)]
+    pub is_backtrack: bool,
+    /// The iteration number within the current turn
+    #[serde(default)]
+    pub iteration: usize,
+}
+
 /// One visible reasoning step. The TUI renders these inline so the user
 /// sees the agent's "thought process".
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,16 +362,33 @@ pub struct ReasoningStep {
     pub tool_call: Option<ToolCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_result: Option<ToolOutcome>,
+    /// Structured decision metadata extracted from reasoning text
+    #[serde(default, skip_serializing_if = "DecisionMetadata::is_default")]
+    pub decision: DecisionMetadata,
+}
+
+impl DecisionMetadata {
+    pub fn is_default(&self) -> bool {
+        self.confidence.is_none()
+            && self.chosen_approach.is_none()
+            && self.alternatives.is_none()
+            && self.key_tradeoff.is_none()
+            && !self.is_backtrack
+            && self.iteration == 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReasoningKind {
-    Plan,       // "I need to search for X, then edit Y"
-    Observe,    // "The search returned ..."
-    Reflect,    // "That didn't work, trying Z instead"
-    Decide,     // "I will run `cargo test`"
-    Execute,    // Actually running something
-    Error,      // Something went wrong
+    Plan,      // "I need to search for X, then edit Y"
+    Observe,   // "The search returned ..."
+    Reflect,   // "That didn't work, trying Z instead"
+    Decide,    // "I will run `cargo test`"
+    Execute,   // Actually running something
+    Error,     // Something went wrong
+    Analyze,   // REASON: Restating and understanding the problem
+    Evaluate,  // REASON: Comparing trade-offs between options
+    Backtrack, // Abandoning a path and trying an alternative
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -391,11 +529,70 @@ pub struct NativeToolResult {
     pub is_error: bool,
 }
 
+/// Token accounting reported by an LLM provider.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    /// Tokens consumed by the prompt (system + history + tools).
+    pub prompt: u64,
+    /// Tokens produced by the model.
+    pub completion: u64,
+}
+
+impl TokenUsage {
+    pub fn new(prompt: u64, completion: u64) -> Self {
+        Self { prompt, completion }
+    }
+
+    pub fn total(&self) -> u64 {
+        self.prompt + self.completion
+    }
+
+    /// Accumulate another usage record into this one.
+    pub fn merge(&mut self, other: TokenUsage) {
+        self.prompt += other.prompt;
+        self.completion += other.completion;
+    }
+}
+
+/// A lock-free slot holding the token usage of the most recent provider call.
+///
+/// Providers report usage in the HTTP response, but the `LlmProvider` trait
+/// methods return plain text. The provider stores the numbers here and the
+/// orchestrator reads them back after each call.
+#[derive(Debug, Default)]
+pub struct UsageSlot {
+    prompt: std::sync::atomic::AtomicU64,
+    completion: std::sync::atomic::AtomicU64,
+    valid: std::sync::atomic::AtomicBool,
+}
+
+impl UsageSlot {
+    pub fn store(&self, usage: TokenUsage) {
+        use std::sync::atomic::Ordering;
+        self.prompt.store(usage.prompt, Ordering::Relaxed);
+        self.completion.store(usage.completion, Ordering::Relaxed);
+        self.valid.store(true, Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> Option<TokenUsage> {
+        use std::sync::atomic::Ordering;
+        if !self.valid.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some(TokenUsage::new(
+            self.prompt.load(Ordering::Relaxed),
+            self.completion.load(Ordering::Relaxed),
+        ))
+    }
+}
+
 /// What an LLM turn produces: either text, tool calls, or both.
 #[derive(Debug, Clone, Default)]
 pub struct TurnOutput {
     pub text: String,
     pub tool_calls: Vec<NativeToolCall>,
+    /// Token usage for this call, when the provider reports it.
+    pub usage: Option<TokenUsage>,
 }
 
 impl TurnOutput {
@@ -422,6 +619,11 @@ pub trait LlmProvider: Send + Sync {
 
     /// Basic chat without tools (text-only fallback).
     async fn chat(&self, model: &str, messages: Vec<ChatMessage>) -> anyhow::Result<String>;
+
+    /// Token usage reported by the most recent call, if the provider exposes it.
+    fn last_usage(&self) -> Option<TokenUsage> {
+        None
+    }
 
     /// Basic streaming chat without tools.
     async fn chat_stream(
@@ -477,7 +679,8 @@ fn inject_tools_into_prompt(base: &str, tools: &[NativeToolDef]) -> String {
     let mut prompt = base.to_string();
     if !tools.is_empty() {
         prompt.push_str("\n\nYou have access to the following tools. ");
-        prompt.push_str("When you need to use a tool, output ONE standalone JSON block per line:\n");
+        prompt
+            .push_str("When you need to use a tool, output ONE standalone JSON block per line:\n");
         prompt.push_str(r#"{"tool": "tool_name", "arguments": {"param": "value"}}"#);
         prompt.push('\n');
         prompt.push_str("Do NOT wrap tool calls in markdown code fences.\n\n");
@@ -503,6 +706,7 @@ pub fn parse_tool_calls_native(text: &str) -> TurnOutput {
                 arguments: tc.arguments,
             })
             .collect(),
+        usage: None,
     }
 }
 
@@ -511,7 +715,7 @@ pub fn parse_tool_calls_native(text: &str) -> TurnOutput {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Parse tool calls embedded in an LLM text response.
-/// 
+///
 /// Detects several formats:
 ///   1. OpenAI function call JSON: {"name":"tool","arguments":{...}}
 ///   2. Anthropic tool use: {"tool":"name", "arguments":{...}}
@@ -554,7 +758,10 @@ fn try_parse_tool_json(json_str: &str) -> Option<ToolCall> {
 
     // Format 1: {"tool": "name", "arguments": {...}}
     if let Some(tool) = value.get("tool").and_then(|v| v.as_str()) {
-        let args = value.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
+        let args = value
+            .get("arguments")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         return Some(ToolCall {
             id: Id::new(),
             name: tool.to_string(),
@@ -564,7 +771,10 @@ fn try_parse_tool_json(json_str: &str) -> Option<ToolCall> {
 
     // Format 2: {"name": "name", "arguments": {...}} (OpenAI style)
     if let Some(name) = value.get("name").and_then(|v| v.as_str()) {
-        let args = value.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
+        let args = value
+            .get("arguments")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         return Some(ToolCall {
             id: Id::new(),
             name: name.to_string(),
@@ -575,7 +785,10 @@ fn try_parse_tool_json(json_str: &str) -> Option<ToolCall> {
     // Format 3: {"function": {"name": "...", "arguments": "..."}} (OpenAI chat completion)
     if let Some(func) = value.get("function") {
         if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
-            let args_str = func.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
+            let args_str = func
+                .get("arguments")
+                .and_then(|v| v.as_str())
+                .unwrap_or("{}");
             let args = serde_json::from_str(args_str).unwrap_or(serde_json::Value::Null);
             return Some(ToolCall {
                 id: Id::new(),

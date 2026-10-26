@@ -1,17 +1,17 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::Sender;
 
-use okc_core::{ChatMessage, LlmProvider, StreamTx};
+use okc_core::{ChatMessage, LlmProvider, StreamTx, TokenUsage, UsageSlot};
 
-use crate::streaming::{into_sse_stream, SseEvent};
+use crate::streaming::into_sse_stream;
 
 /// Ollama provider — speaks the Ollama REST API which is *mostly* OpenAI-compatible
 /// but has a few differences. We use its native `/api/chat` endpoint.
 pub struct OllamaProvider {
     client: reqwest::Client,
     base_url: String,
+    usage: UsageSlot,
 }
 
 impl OllamaProvider {
@@ -19,6 +19,7 @@ impl OllamaProvider {
         Self {
             client: reqwest::Client::new(),
             base_url: base_url.trim_end_matches('/').to_string(),
+            usage: UsageSlot::default(),
         }
     }
 }
@@ -31,6 +32,10 @@ impl LlmProvider for OllamaProvider {
 
     fn supports_streaming(&self) -> bool {
         true
+    }
+
+    fn last_usage(&self) -> Option<TokenUsage> {
+        self.usage.get()
     }
 
     async fn chat(&self, model: &str, messages: Vec<ChatMessage>) -> Result<String> {
@@ -55,6 +60,8 @@ impl LlmProvider for OllamaProvider {
         }
 
         let body: OllamaResponse = resp.json().await.context("parsing response")?;
+        self.usage
+            .store(TokenUsage::new(body.prompt_eval_count, body.eval_count));
         Ok(body.message.content)
     }
 
@@ -93,6 +100,8 @@ impl LlmProvider for OllamaProvider {
             };
             let _ = tx.send(chunk.message.content).await;
             if chunk.done {
+                self.usage
+                    .store(TokenUsage::new(chunk.prompt_eval_count, chunk.eval_count));
                 break;
             }
         }
@@ -114,10 +123,18 @@ struct OllamaResponse {
     message: OllamaMessage,
     #[serde(default)]
     done: bool,
+    /// Tokens in the prompt (only present on the final chunk).
+    #[serde(default)]
+    prompt_eval_count: u64,
+    /// Tokens generated (only present on the final chunk).
+    #[serde(default)]
+    eval_count: u64,
 }
 
 #[derive(Debug, Deserialize)]
 struct OllamaMessage {
+    /// Who produced the message ("assistant").
+    #[allow(dead_code)]
     role: String,
     content: String,
 }

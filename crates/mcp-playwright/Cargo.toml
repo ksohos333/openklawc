@@ -1,0 +1,24 @@
+[package]
+name = "mcp-playwright"
+version = "0.2.0"
+edition = "2021"
+authors = ["bpoppa12"]
+license = "MIT"
+
+[[bin]]
+name = "mcp-playwright"
+path = "src/main.rs"
+
+[dependencies]
+okc-mcp = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = "0.30"
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+reqwest = { workspace = true }
+dirs = { workspace = true }
+base64 = "0.22"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

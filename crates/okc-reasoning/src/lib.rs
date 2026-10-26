@@ -6,14 +6,16 @@
 //! Native tool calling is supported for OpenAI and Anthropic providers.
 //! Fallback to text-based JSON parsing for all other providers.
 
+pub mod context;
+pub mod delegate;
 pub mod orchestrator;
+pub mod persona;
 pub mod prompt;
+pub mod workflow;
 
 use std::sync::Arc;
 
-use okc_core::{
-    AutonomyLevel, ChatMessage, EventBus, ReasoningStep, ToolExecutor,
-};
+use okc_core::{AutonomyLevel, ChatMessage, EventBus, ReasoningStep, ToolExecutor};
 use okc_llm::LlmClient;
 use tokio::sync::mpsc;
 
@@ -29,13 +31,43 @@ pub enum AgentUpdate {
     /// A reasoning / planning step.
     Reasoning { kind: String, content: String },
     /// A tool was invoked.
-    ToolCall { name: String, arguments: serde_json::Value },
+    ToolCall {
+        name: String,
+        arguments: serde_json::Value,
+    },
     /// A tool returned a result.
-    ToolResult { name: String, success: bool, result: serde_json::Value, elapsed_ms: u64 },
+    ToolResult {
+        name: String,
+        success: bool,
+        result: serde_json::Value,
+        elapsed_ms: u64,
+    },
     /// Turn complete.
-    Done { text: String, messages: Vec<ChatMessage> },
+    Done {
+        text: String,
+        messages: Vec<ChatMessage>,
+        /// Token usage for the turn, when the provider reported it.
+        usage: Option<okc_core::TokenUsage>,
+    },
     /// Turn failed.
     Error(String),
+}
+
+/// A tool call waiting for the user's approval.
+///
+/// The agent sends one of these over `Agent::confirm_tx` and waits for the
+/// matching response. `respond` carries the answer: `true` allows the call,
+/// `false` denies it.
+#[derive(Debug)]
+pub struct ConfirmRequest {
+    /// Provider-assigned call id, echoed back in the tool result.
+    pub id: String,
+    /// Tool name.
+    pub name: String,
+    /// Tool arguments, for display.
+    pub arguments: serde_json::Value,
+    /// Send `true` to allow the call, `false` to deny it.
+    pub respond: tokio::sync::oneshot::Sender<bool>,
 }
 
 /// The agent. Owns the LLM client, tools, and autonomy level.
@@ -50,6 +82,17 @@ pub struct Agent {
     pub streaming: bool,
     pub reasoning_log: Vec<ReasoningStep>,
     pub update_tx: Option<mpsc::Sender<AgentUpdate>>,
+    /// Optional fast decision layer (Laya / Ollaya) for plan validation.
+    pub decision_orchestrator: Option<okc_decision::DecisionOrchestrator>,
+    /// Runtime orchestrator configuration.
+    pub config: crate::orchestrator::OrchestratorConfig,
+    /// Active persona (if any).
+    pub persona: Option<crate::persona::Persona>,
+    /// Channel used to ask the user to approve a tool call.
+    ///
+    /// When `None` there is nobody to ask, so calls that need approval are
+    /// denied rather than silently executed.
+    pub confirm_tx: Option<mpsc::Sender<ConfirmRequest>>,
 }
 
 impl Agent {
@@ -72,11 +115,62 @@ impl Agent {
             streaming: true,
             reasoning_log: Vec::new(),
             update_tx: None,
+            decision_orchestrator: None,
+            config: crate::orchestrator::OrchestratorConfig::default(),
+            persona: None,
+            confirm_tx: None,
+        }
+    }
+
+    /// Attach a decision orchestrator for fast plan validation.
+    pub fn with_decision_layer(mut self, orchestrator: okc_decision::DecisionOrchestrator) -> Self {
+        self.decision_orchestrator = Some(orchestrator);
+        self
+    }
+
+    /// Apply runtime configuration.
+    pub fn with_config(mut self, config: crate::orchestrator::OrchestratorConfig) -> Self {
+        self.max_iterations = config.max_iterations;
+        self.config = config;
+        self
+    }
+
+    /// Set an active persona.
+    pub fn with_persona(mut self, persona: crate::persona::Persona) -> Self {
+        self.persona = Some(persona);
+        self
+    }
+
+    /// Produce an independent copy of this agent for a background turn.
+    ///
+    /// The copy shares the provider, tool executor and event bus (all
+    /// reference counted) but owns its own reasoning log, so a turn running in
+    /// a spawned task cannot corrupt the interactive agent's state.
+    pub fn fork(&self) -> Self {
+        Self {
+            llm_client: self.llm_client.clone(),
+            provider: self.provider.clone(),
+            model_id: self.model_id.clone(),
+            tools: self.tools.clone(),
+            autonomy: self.autonomy,
+            event_bus: self.event_bus.clone(),
+            max_iterations: self.max_iterations,
+            streaming: self.streaming,
+            reasoning_log: Vec::new(),
+            update_tx: self.update_tx.clone(),
+            decision_orchestrator: self.decision_orchestrator.clone(),
+            config: self.config.clone(),
+            persona: self.persona.clone(),
+            confirm_tx: self.confirm_tx.clone(),
         }
     }
 
     /// Run one complete turn.
-    pub async fn run_turn(&mut self, user_input: &str, messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    pub async fn run_turn(
+        &mut self,
+        user_input: &str,
+        messages: Vec<ChatMessage>,
+    ) -> Vec<ChatMessage> {
         let mut orch = Orchestrator {
             llm_client: self.llm_client.clone(),
             provider: self.provider.clone(),
@@ -87,6 +181,12 @@ impl Agent {
             max_iterations: self.max_iterations,
             update_tx: self.update_tx.clone(),
             reasoning_log: Vec::new(),
+            backtrack_count: 0,
+            max_backtracks: 3,
+            decision_orchestrator: self.decision_orchestrator.clone(),
+            config: self.config.clone(),
+            persona: self.persona.clone(),
+            confirm_tx: self.confirm_tx.clone(),
         };
 
         let new_messages = orch.run_turn(user_input, messages).await;

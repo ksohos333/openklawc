@@ -1,0 +1,43 @@
+# Example OpenKLawc Workflow
+# Save as .openklawc/workflows/code_review.yaml
+# Usage: openklawc workflow run code_review
+
+name: code_review
+description: Review changed files in the current git branch
+inputs:
+  - name: target_branch
+    description: Branch to diff against
+    default: main
+    required: false
+steps:
+  - name: get_diff
+    type: tool
+    tool: shell
+    arguments:
+      command: "git diff {target_branch} --name-only"
+
+  - name: read_files
+    type: tool
+    tool: shell
+    arguments:
+      command: "git diff {target_branch}"
+
+  - name: review
+    type: llm
+    persona: reviewer
+    prompt: >
+      Review the following code changes for bugs, style issues,
+      and security concerns. Rate each issue as [critical], [warning], or [nit].
+
+      Files changed: {get_diff.result}
+
+      Diff:
+      {read_files.result}
+
+  - name: summary
+    type: llm
+    prompt: >
+      Summarize the code review into a concise comment suitable
+      for a GitHub PR. Include the most important findings first.
+
+      Detailed review: {review.result}

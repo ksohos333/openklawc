@@ -33,15 +33,23 @@ async fn main() -> Result<()> {
             },
             "required": ["claim"]
         }),
-        Box::new(|args| Box::pin(async move {
-            let claim = args["claim"].as_str().ok_or_else(|| anyhow!("claim required"))?;
-            let urls: Vec<String> = args["source_urls"]
-                .as_array()
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                .unwrap_or_default();
-            let result = verify_claim(claim, urls).await;
-            Ok(json!(result))
-        })),
+        Box::new(|args| {
+            Box::pin(async move {
+                let claim = args["claim"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("claim required"))?;
+                let urls: Vec<String> = args["source_urls"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let result = verify_claim(claim, urls).await;
+                Ok(json!(result))
+            })
+        }),
     );
 
     // ─── note_observation ─────────────────────────────────────────────────
@@ -57,13 +65,19 @@ async fn main() -> Result<()> {
             },
             "required": ["observation", "source_url"]
         }),
-        Box::new(|args| Box::pin(async move {
-            let obs = args["observation"].as_str().ok_or_else(|| anyhow!("observation required"))?;
-            let url = args["source_url"].as_str().ok_or_else(|| anyhow!("source_url required"))?;
-            let kind = args["source_kind"].as_str().unwrap_or("unspecified");
-            let result = note_observation(obs, url, kind).await;
-            Ok(json!(result))
-        })),
+        Box::new(|args| {
+            Box::pin(async move {
+                let obs = args["observation"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("observation required"))?;
+                let url = args["source_url"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("source_url required"))?;
+                let kind = args["source_kind"].as_str().unwrap_or("unspecified");
+                let result = note_observation(obs, url, kind).await;
+                Ok(json!(result))
+            })
+        }),
     );
 
     // ─── list_observations ────────────────────────────────────────────────
@@ -76,11 +90,13 @@ async fn main() -> Result<()> {
                 "limit": { "type": "integer", "default": 20 }
             }
         }),
-        Box::new(|args| Box::pin(async move {
-            let limit = args["limit"].as_u64().unwrap_or(20) as usize;
-            let result = list_observations(limit).await;
-            Ok(json!(result))
-        })),
+        Box::new(|args| {
+            Box::pin(async move {
+                let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+                let result = list_observations(limit).await;
+                Ok(json!(result))
+            })
+        }),
     );
 
     server.run().await
@@ -134,9 +150,12 @@ async fn verify_claim(claim: &str, source_urls: Vec<String>) -> VerifyResult {
     let mut urls = source_urls;
 
     // If no URLs provided, search for sources
+    let mut search_titles: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     if urls.is_empty() {
-        let search = search_ddg(&format!("{}", claim)).await;
+        let search = search_ddg(claim).await;
         for item in search.into_iter().take(5) {
+            search_titles.insert(item.url.clone(), item.title);
             urls.push(item.url);
         }
     }
@@ -151,7 +170,7 @@ async fn verify_claim(claim: &str, source_urls: Vec<String>) -> VerifyResult {
             },
             Err(e) => SourceCheck {
                 url: url.clone(),
-                title: None,
+                title: search_titles.get(&url).cloned(),
                 observed_facts: None,
                 error: Some(e.to_string()),
             },
@@ -260,9 +279,10 @@ async fn fetch_and_extract(url: &str) -> Result<(Option<String>, String)> {
 
 fn build_client() -> Result<reqwest::Client> {
     let mut headers = HeaderMap::new();
-    headers.insert(USER_AGENT, HeaderValue::from_static(
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
-    ));
+    headers.insert(
+        USER_AGENT,
+        HeaderValue::from_static("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"),
+    );
     reqwest::Client::builder()
         .default_headers(headers)
         .build()
@@ -271,7 +291,8 @@ fn build_client() -> Result<reqwest::Client> {
 
 fn parse_html(html: &str) -> (Option<String>, String, Vec<String>) {
     let doc = Html::parse_document(html);
-    let title = doc.select(&Selector::parse("title").unwrap())
+    let title = doc
+        .select(&Selector::parse("title").unwrap())
         .next()
         .map(|e| e.text().collect::<String>().trim().to_string());
 
@@ -326,7 +347,12 @@ async fn search_ddg(query: &str) -> Vec<SearchItem> {
         Err(_) => return Vec::new(),
     };
 
-    let body = match client.get(&url).timeout(std::time::Duration::from_secs(30)).send().await {
+    let body = match client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+    {
         Ok(r) => match r.text().await {
             Ok(b) => b,
             Err(_) => return Vec::new(),
@@ -342,7 +368,10 @@ async fn search_ddg(query: &str) -> Vec<SearchItem> {
 
     for result in doc.select(&result_sel) {
         let title = result
-            .select(&Selector::parse(".result__title").unwrap_or_else(|_| Selector::parse("h2").unwrap()))
+            .select(
+                &Selector::parse(".result__title")
+                    .unwrap_or_else(|_| Selector::parse("h2").unwrap()),
+            )
             .next()
             .map(|e| e.text().collect::<String>().trim().to_string())
             .unwrap_or_default();

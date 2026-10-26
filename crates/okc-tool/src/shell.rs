@@ -5,7 +5,11 @@ use std::process::Stdio;
 use tokio::process::Command;
 
 /// Run a command with a timeout, returning structured output.
-pub async fn run(cmd: &str, cwd: Option<&str>, timeout_secs: u64) -> anyhow::Result<okc_core::ShellResult> {
+pub async fn run(
+    cmd: &str,
+    cwd: Option<&str>,
+    timeout_secs: u64,
+) -> anyhow::Result<okc_core::ShellResult> {
     let mut command = Command::new("sh");
     command.arg("-c").arg(cmd);
     if let Some(cwd) = cwd {

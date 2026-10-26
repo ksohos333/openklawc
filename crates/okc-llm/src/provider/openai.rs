@@ -4,15 +4,18 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use okc_core::{ChatMessage, LlmProvider, NativeToolDef, StreamTx, TurnOutput};
+use okc_core::{
+    ChatMessage, LlmProvider, NativeToolDef, StreamTx, TokenUsage, TurnOutput, UsageSlot,
+};
 
 use crate::native_tools::{parse_openai_message, to_openai_tools};
-use crate::streaming::{into_sse_stream, SseEvent};
+use crate::streaming::into_sse_stream;
 
 pub struct OpenAiProvider {
     client: reqwest::Client,
     base_url: String,
     api_key: String,
+    usage: UsageSlot,
 }
 
 impl OpenAiProvider {
@@ -21,6 +24,7 @@ impl OpenAiProvider {
             client: reqwest::Client::new(),
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
+            usage: UsageSlot::default(),
         }
     }
 }
@@ -39,10 +43,14 @@ impl LlmProvider for OpenAiProvider {
         true
     }
 
+    fn last_usage(&self) -> Option<TokenUsage> {
+        self.usage.get()
+    }
+
     async fn chat(&self, model: &str, messages: Vec<ChatMessage>) -> Result<String> {
         let req = OpenAiRequest {
             model: model.to_string(),
-            messages: messages.into_iter().map(Into::into).collect(),
+            messages: to_openai_messages(messages),
             stream: false,
             tools: None,
         };
@@ -64,6 +72,10 @@ impl LlmProvider for OpenAiProvider {
         }
 
         let body: OpenAiResponse = resp.json().await.context("parsing response")?;
+        if let Some(u) = &body.usage {
+            self.usage
+                .store(TokenUsage::new(u.prompt_tokens, u.completion_tokens));
+        }
         let text = body
             .choices
             .into_iter()
@@ -82,7 +94,7 @@ impl LlmProvider for OpenAiProvider {
     ) -> Result<()> {
         let req = OpenAiRequest {
             model: model.to_string(),
-            messages: messages.into_iter().map(Into::into).collect(),
+            messages: to_openai_messages(messages),
             stream: true,
             tools: None,
         };
@@ -99,7 +111,7 @@ impl LlmProvider for OpenAiProvider {
     ) -> Result<TurnOutput> {
         let req = OpenAiRequest {
             model: model.to_string(),
-            messages: messages.into_iter().map(Into::into).collect(),
+            messages: to_openai_messages(messages),
             stream: false,
             tools: Some(to_openai_tools(&tools)),
         };
@@ -121,6 +133,10 @@ impl LlmProvider for OpenAiProvider {
         }
 
         let body: OpenAiResponse = resp.json().await.context("parsing response")?;
+        if let Some(u) = &body.usage {
+            self.usage
+                .store(TokenUsage::new(u.prompt_tokens, u.completion_tokens));
+        }
         let message = body
             .choices
             .into_iter()
@@ -141,7 +157,7 @@ impl LlmProvider for OpenAiProvider {
     ) -> Result<TurnOutput> {
         let req = OpenAiRequest {
             model: model.to_string(),
-            messages: messages.into_iter().map(Into::into).collect(),
+            messages: to_openai_messages(messages),
             stream: true,
             tools: Some(to_openai_tools(&tools)),
         };
@@ -163,6 +179,7 @@ impl LlmProvider for OpenAiProvider {
         Ok(TurnOutput {
             text: full,
             tool_calls: Vec::new(),
+            usage: self.last_usage(),
         })
     }
 }
@@ -230,20 +247,73 @@ struct OpenAiMessage {
     tool_call_id: Option<String>,
 }
 
-impl From<ChatMessage> for OpenAiMessage {
-    fn from(msg: ChatMessage) -> Self {
-        Self {
+/// Translate our message history into OpenAI's wire format.
+///
+/// Tool results become one `role: "tool"` message per result (carrying the
+/// originating `tool_call_id`), and assistant tool calls are rebuilt as the
+/// native `tool_calls` array so the API can match them to their results.
+fn to_openai_messages(messages: Vec<ChatMessage>) -> Vec<OpenAiMessage> {
+    let mut out = Vec::new();
+
+    for msg in messages {
+        if let Some(results) = msg.tool_results {
+            for result in results {
+                out.push(OpenAiMessage {
+                    role: "tool".to_string(),
+                    content: Some(if result.is_error {
+                        format!("Error: {}", result.content)
+                    } else {
+                        result.content
+                    }),
+                    tool_calls: Vec::new(),
+                    tool_call_id: Some(result.call_id),
+                });
+            }
+            continue;
+        }
+
+        let mut tool_calls = Vec::new();
+        if let Some(calls) = msg.tool_calls {
+            for call in calls {
+                let arguments = match call.arguments.as_str() {
+                    Some(raw) => raw.to_string(),
+                    None => call.arguments.to_string(),
+                };
+                tool_calls.push(serde_json::json!({
+                    "id": call.id,
+                    "type": "function",
+                    "function": {
+                        "name": call.name,
+                        "arguments": arguments,
+                    }
+                }));
+            }
+        }
+
+        out.push(OpenAiMessage {
             role: msg.role.to_string(),
             content: Some(msg.content).filter(|s| !s.is_empty()),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-        }
+            tool_calls,
+            tool_call_id: msg.name,
+        });
     }
+
+    out
 }
 
 #[derive(Debug, Deserialize)]
 struct OpenAiResponse {
     choices: Vec<OpenAiChoice>,
+    #[serde(default)]
+    usage: Option<OpenAiUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]

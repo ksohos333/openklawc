@@ -2,19 +2,29 @@
 //!
 //! Usage:
 //! ```rust,no_run
+//! use okc_mcp::server::McpServer;
+//! use serde_json::json;
+//!
+//! # async fn example() -> anyhow::Result<()> {
 //! let mut server = McpServer::new("my_server");
-//! server.add_tool(tool_schema, |args| async { Ok(json!("hello")) });
+//! let schema = json!({"type": "object", "properties": {}});
+//! server.add_tool(
+//!     "greet",
+//!     "Say hello",
+//!     schema,
+//!     Box::new(|args| Box::pin(async move { Ok(json!("hello")) })),
+//! );
 //! server.run().await?;
+//! # Ok(())
+//! # }
 //! ```
 
 use std::collections::HashMap;
-use std::io;
 
 use anyhow::{anyhow, Result};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::Mutex;
 
 use crate::client::McpTool;
 
@@ -29,7 +39,6 @@ pub struct McpServer {
     version: String,
     tools: Vec<McpTool>,
     handlers: HashMap<String, ToolHandler>,
-    next_id: Mutex<u64>,
 }
 
 impl McpServer {
@@ -39,7 +48,6 @@ impl McpServer {
             version: env!("CARGO_PKG_VERSION").to_string(),
             tools: Vec::new(),
             handlers: HashMap::new(),
-            next_id: Mutex::new(1),
         }
     }
 
@@ -150,7 +158,21 @@ impl McpServer {
             .ok_or_else(|| anyhow!("unknown tool: {}", name))?;
 
         let result = handler(arguments).await?;
-        Ok(serde_json::json!({ "content": [{ "type": "text", "text": result.to_string() }] }))
+
+        // A handler may return:
+        //   * a string            → one text content block,
+        //   * an MCP-shaped object → passed through unchanged (e.g. image or
+        //     audio blocks),
+        //   * anything else       → serialised into one text content block.
+        let value = if let Some(text) = result.as_str() {
+            serde_json::json!({ "content": [{ "type": "text", "text": text }] })
+        } else if result.get("content").map(|c| c.is_array()).unwrap_or(false) {
+            result
+        } else {
+            serde_json::json!({ "content": [{ "type": "text", "text": result.to_string() }] })
+        };
+
+        Ok(value)
     }
 
     async fn write_line(stdout: &mut tokio::io::Stdout, text: &str) -> Result<()> {
@@ -163,6 +185,8 @@ impl McpServer {
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
+    /// Protocol version tag; required by the spec but not acted on.
+    #[allow(dead_code)]
     jsonrpc: String,
     id: Option<serde_json::Value>,
     method: String,

@@ -4,15 +4,19 @@ use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use okc_core::{ChatMessage, LlmProvider, NativeToolDef, NativeToolResult, Role, StreamTx, TurnOutput};
+use okc_core::{
+    ChatMessage, LlmProvider, NativeToolDef, NativeToolResult, Role, StreamTx, TokenUsage,
+    TurnOutput, UsageSlot,
+};
 
-use crate::native_tools::{parse_anthropic_content, to_anthropic_tool_result, to_anthropic_tool_results, to_anthropic_tools};
-use crate::streaming::{into_sse_stream, SseEvent};
+use crate::native_tools::{parse_anthropic_content, to_anthropic_tool_results, to_anthropic_tools};
+use crate::streaming::into_sse_stream;
 
 pub struct AnthropicProvider {
     client: reqwest::Client,
     base_url: String,
     api_key: String,
+    usage: UsageSlot,
 }
 
 impl AnthropicProvider {
@@ -21,6 +25,7 @@ impl AnthropicProvider {
             client: reqwest::Client::new(),
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
+            usage: UsageSlot::default(),
         }
     }
 
@@ -50,6 +55,10 @@ impl LlmProvider for AnthropicProvider {
         true
     }
 
+    fn last_usage(&self) -> Option<TokenUsage> {
+        self.usage.get()
+    }
+
     async fn chat(&self, model: &str, messages: Vec<ChatMessage>) -> Result<String> {
         let (system, user_messages) = extract_system(messages);
         let req = AnthropicRequest {
@@ -77,11 +86,17 @@ impl LlmProvider for AnthropicProvider {
         }
 
         let body: AnthropicResponse = resp.json().await.context("parsing response")?;
+        if let Some(u) = &body.usage {
+            self.usage
+                .store(TokenUsage::new(u.input_tokens, u.output_tokens));
+        }
         let text = body
             .content
             .iter()
             .filter_map(|b| {
-                b.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                b.get("text")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string())
             })
             .collect::<String>();
         Ok(text)
@@ -139,6 +154,10 @@ impl LlmProvider for AnthropicProvider {
         }
 
         let body: AnthropicResponse = resp.json().await.context("parsing response")?;
+        if let Some(u) = &body.usage {
+            self.usage
+                .store(TokenUsage::new(u.input_tokens, u.output_tokens));
+        }
         Ok(parse_anthropic_content(&body.content))
     }
 
@@ -209,12 +228,39 @@ fn extract_system(messages: Vec<ChatMessage>) -> (Option<String>, Vec<AnthropicM
                 "user".to_string()
             };
 
-            // Detect if content is already a JSON array of content blocks
-            // (e.g., tool_result blocks injected by the orchestrator)
+            // Structured tool results → user message with `tool_result` blocks.
+            if let Some(results) = &m.tool_results {
+                let blocks = to_anthropic_tool_results(results);
+                return AnthropicMessage {
+                    role,
+                    content: serde_json::json!(blocks),
+                };
+            }
+
+            // Structured tool calls → assistant message with `tool_use` blocks.
+            if let Some(calls) = &m.tool_calls {
+                let mut blocks: Vec<Value> = Vec::new();
+                if !m.content.trim().is_empty() {
+                    blocks.push(serde_json::json!({ "type": "text", "text": m.content }));
+                }
+                for call in calls {
+                    blocks.push(serde_json::json!({
+                        "type": "tool_use",
+                        "id": call.id,
+                        "name": call.name,
+                        "input": call.arguments,
+                    }));
+                }
+                return AnthropicMessage {
+                    role,
+                    content: serde_json::json!(blocks),
+                };
+            }
+
+            // Plain text message. Legacy sessions may have serialised content
+            // blocks into the string, so keep that path working.
             let content = if m.content.trim().starts_with('[') {
-                serde_json::from_str(&m.content).unwrap_or_else(|_| {
-                    serde_json::json!(m.content)
-                })
+                serde_json::from_str(&m.content).unwrap_or_else(|_| serde_json::json!(m.content))
             } else {
                 serde_json::json!(m.content)
             };
@@ -242,7 +288,7 @@ struct AnthropicRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct AnthropicMessage {
+pub struct AnthropicMessage {
     role: String,
     content: Value, // Can be String or array of content blocks
 }
@@ -251,10 +297,22 @@ struct AnthropicMessage {
 struct AnthropicResponse {
     #[serde(default)]
     content: Vec<Value>,
+    #[serde(default)]
+    usage: Option<AnthropicUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]
 struct AnthropicStreamEvent {
+    /// Event discriminator ("message_start", "content_block_delta", …).
+    #[allow(dead_code)]
     #[serde(rename = "type")]
     ty: String,
     #[serde(default)]
@@ -263,6 +321,8 @@ struct AnthropicStreamEvent {
 
 #[derive(Debug, Deserialize)]
 struct AnthropicDelta {
+    /// Delta discriminator ("text_delta", "input_json_delta", …).
+    #[allow(dead_code)]
     #[serde(rename = "type")]
     ty: Option<String>,
     text: Option<String>,

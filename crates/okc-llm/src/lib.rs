@@ -12,11 +12,9 @@ pub mod streaming;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
-use async_trait::async_trait;
+use anyhow::Result;
 use okc_config::Config;
 use okc_core::{ChatMessage, LlmProvider, ModelCapabilities, ModelRef, StreamTx};
-use tokio::sync::RwLock;
 
 pub use provider::anthropic::AnthropicProvider;
 pub use provider::ollama::OllamaProvider;
@@ -27,6 +25,12 @@ pub struct ProviderRegistry {
     providers: HashMap<String, Arc<dyn LlmProvider>>,
     models: Vec<ModelRef>,
     default_model: String,
+}
+
+impl Default for ProviderRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ProviderRegistry {
@@ -43,12 +47,28 @@ impl ProviderRegistry {
         registry.default_model = cfg.model.clone();
 
         for (name, prov_cfg) in &cfg.provider {
-            let provider: Arc<dyn LlmProvider> = if prov_cfg.base_url.contains("anthropic") {
-                Arc::new(AnthropicProvider::new(&prov_cfg.base_url, &prov_cfg.api_key))
-            } else if prov_cfg.base_url.contains("ollama") || prov_cfg.base_url.contains(":11434") {
-                Arc::new(OllamaProvider::new(&prov_cfg.base_url))
-            } else {
-                Arc::new(OpenAiProvider::new(&prov_cfg.base_url, &prov_cfg.api_key))
+            let provider: Arc<dyn LlmProvider> = match prov_cfg.api.as_deref().map(|a| a.to_lowercase()) {
+                Some(ref api) if api == "anthropic" => {
+                    Arc::new(AnthropicProvider::new(&prov_cfg.base_url, &prov_cfg.api_key))
+                }
+                Some(ref api) if api == "ollama" => {
+                    Arc::new(OllamaProvider::new(&prov_cfg.base_url))
+                }
+                Some(ref api) if api == "openai" || api == "openai-compatible" => {
+                    Arc::new(OpenAiProvider::new(&prov_cfg.base_url, &prov_cfg.api_key))
+                }
+                // No explicit API type: infer it from the base URL.
+                _ => {
+                    if prov_cfg.base_url.contains("anthropic") {
+                        Arc::new(AnthropicProvider::new(&prov_cfg.base_url, &prov_cfg.api_key))
+                    } else if prov_cfg.base_url.contains("ollama")
+                        || prov_cfg.base_url.contains(":11434")
+                    {
+                        Arc::new(OllamaProvider::new(&prov_cfg.base_url))
+                    } else {
+                        Arc::new(OpenAiProvider::new(&prov_cfg.base_url, &prov_cfg.api_key))
+                    }
+                }
             };
 
             registry.providers.insert(name.clone(), provider.clone());
@@ -107,11 +127,15 @@ impl ProviderRegistry {
 
 fn detect_capabilities(model_id: &str) -> ModelCapabilities {
     let id = model_id.to_lowercase();
+    let reasoning_models = ["reasoning", "deepseek-r1", "qwen3", "minimax", "glm"];
+    let tool_models = ["gpt", "claude", "qwen", "minimax", "glm"];
     ModelCapabilities {
-        reasoning: id.contains("o1") || id.contains("o3") || id.contains("reasoning") || id.contains("deepseek-r1") || id.contains("qwen3"),
+        reasoning: reasoning_models.iter().any(|m| id.contains(m))
+            || id.contains("o1")
+            || id.contains("o3"),
         vision: id.contains("vision") || id.contains("claude-3") || id.contains("gpt-4o"),
         streaming: true,
-        function_calling: id.contains("gpt") || id.contains("claude") || id.contains("qwen"),
+        function_calling: tool_models.iter().any(|m| id.contains(m)),
         max_tokens: if id.contains("claude-3-opus") { Some(200_000) } else { Some(128_000) },
     }
 }

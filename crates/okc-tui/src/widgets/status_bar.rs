@@ -1,6 +1,6 @@
 use ratatui::{
     layout::Rect,
-    style::{Modifier, Style},
+    style::Style,
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
     Frame,
@@ -14,9 +14,10 @@ pub fn render_status(
     model: &str,
     autonomy: &str,
     mcp_count: usize,
+    token_count: usize,
     theme: &Theme,
 ) {
-    let spans = vec![
+    let mut spans = vec![
         Span::styled("model: ", Style::default().fg(theme.fg_dim)),
         Span::styled(model, Style::default().fg(theme.accent)),
         Span::styled(" | ", Style::default().fg(theme.fg_dim)),
@@ -26,6 +27,15 @@ pub fn render_status(
         Span::styled("mcps: ", Style::default().fg(theme.fg_dim)),
         Span::styled(mcp_count.to_string(), Style::default().fg(theme.accent)),
     ];
+
+    if token_count > 0 {
+        spans.push(Span::styled(" | ", Style::default().fg(theme.fg_dim)));
+        spans.push(Span::styled("tokens: ", Style::default().fg(theme.fg_dim)));
+        spans.push(Span::styled(
+            format!("{}", token_count),
+            Style::default().fg(theme.ok),
+        ));
+    }
 
     let block = Block::default()
         .borders(Borders::TOP)

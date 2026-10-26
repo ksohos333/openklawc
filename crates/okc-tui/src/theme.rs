@@ -41,4 +41,12 @@ impl Theme {
             border: Color::Rgb(40, 40, 80),
         }
     }
+
+    /// Resolve a theme by name. Unknown names fall back to `gold`.
+    pub fn from_name(name: &str) -> Self {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "cyberpunk" | "cyber" => Self::cyberpunk(),
+            _ => Self::gold(),
+        }
+    }
 }

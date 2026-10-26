@@ -4,25 +4,32 @@
 //! They form the "yolo" capability of openklawc.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
-use okc_core::{ChatMessage, ShellResult, ToolCall, ToolExecutor, ToolOutcome, ToolSchema};
+use okc_core::{ToolCall, ToolExecutor, ToolOutcome, ToolSchema};
 use serde_json::{json, Value};
 use tokio::process::Command;
-use tracing::{debug, info, warn};
+use tracing::info;
 
 pub mod composite;
+pub mod custom;
 pub mod fs;
 pub mod shell;
 
 pub use composite::CompositeExecutor;
+pub use custom::CustomTools;
 
 /// Built-in tool registry.
 pub struct BuiltInTools {
     schemas: HashMap<String, ToolSchema>,
+}
+
+impl Default for BuiltInTools {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BuiltInTools {
@@ -148,10 +155,6 @@ impl BuiltInTools {
 
         Self { schemas }
     }
-
-    fn is_mutation(name: &str) -> bool {
-        matches!(name, "write_file" | "shell" | "git")
-    }
 }
 
 #[async_trait]
@@ -196,7 +199,9 @@ impl ToolExecutor for BuiltInTools {
 // ─── Tool implementations ────────────────────────────────────────────────────
 
 async fn tool_read_file(args: &Value) -> Result<Value> {
-    let path = args["path"].as_str().ok_or_else(|| anyhow::anyhow!("path required"))?;
+    let path = args["path"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("path required"))?;
     let path = shellexpand::tilde(path);
     let text = tokio::fs::read_to_string(path.as_ref()).await?;
 
@@ -213,8 +218,12 @@ async fn tool_read_file(args: &Value) -> Result<Value> {
 }
 
 async fn tool_write_file(args: &Value) -> Result<Value> {
-    let path = args["path"].as_str().ok_or_else(|| anyhow::anyhow!("path required"))?;
-    let content = args["content"].as_str().ok_or_else(|| anyhow::anyhow!("content required"))?;
+    let path = args["path"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("path required"))?;
+    let content = args["content"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("content required"))?;
     let path = shellexpand::tilde(path);
 
     if let Some(parent) = Path::new(path.as_ref()).parent() {
@@ -244,7 +253,8 @@ fn tool_list_dir_sync(args: &Value) -> Result<Value> {
         }));
 
         if recursive && is_dir {
-            let sub = json!({ "path": entry.path().to_string_lossy().to_string(), "recursive": true });
+            let sub =
+                json!({ "path": entry.path().to_string_lossy().to_string(), "recursive": true });
             if let Ok(sub_result) = tool_list_dir_sync(&sub) {
                 if let Some(sub_entries) = sub_result["entries"].as_array() {
                     for se in sub_entries {
@@ -267,7 +277,9 @@ async fn tool_list_dir(args: &Value) -> Result<Value> {
 }
 
 async fn tool_search_files(args: &Value) -> Result<Value> {
-    let pattern = args["pattern"].as_str().ok_or_else(|| anyhow::anyhow!("pattern required"))?;
+    let pattern = args["pattern"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("pattern required"))?;
     let path = args["path"].as_str().unwrap_or(".");
     let path = shellexpand::tilde(path);
     let glob_pat = args["glob"].as_str().unwrap_or("*");
@@ -316,9 +328,13 @@ async fn tool_search_files(args: &Value) -> Result<Value> {
 }
 
 async fn tool_shell(args: &Value) -> Result<Value> {
-    let cmd = args["command"].as_str().ok_or_else(|| anyhow::anyhow!("command required"))?;
+    let cmd = args["command"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("command required"))?;
     let timeout_secs = args["timeout"].as_u64().unwrap_or(30);
-    let cwd = args["cwd"].as_str().map(|s| shellexpand::tilde(s).to_string());
+    let cwd = args["cwd"]
+        .as_str()
+        .map(|s| shellexpand::tilde(s).to_string());
 
     info!("shell exec: {}", cmd);
 
@@ -353,7 +369,9 @@ async fn tool_git(args: &Value) -> Result<Value> {
         .filter_map(|v| v.as_str().map(String::from))
         .collect();
 
-    let cwd = args["cwd"].as_str().map(|s| shellexpand::tilde(s).to_string());
+    let cwd = args["cwd"]
+        .as_str()
+        .map(|s| shellexpand::tilde(s).to_string());
 
     let mut command = Command::new("git");
     command.args(&git_args);
@@ -379,7 +397,11 @@ async fn tool_view_cwd(args: &Value) -> Result<Value> {
     let mut tree = Vec::new();
     for entry in walkdir::WalkDir::new(&cwd).max_depth(depth) {
         let entry = entry?;
-        let rel = entry.path().strip_prefix(&cwd)?.to_string_lossy().to_string();
+        let rel = entry
+            .path()
+            .strip_prefix(&cwd)?
+            .to_string_lossy()
+            .to_string();
         tree.push(json!({
             "path": rel,
             "is_dir": entry.file_type().is_dir(),

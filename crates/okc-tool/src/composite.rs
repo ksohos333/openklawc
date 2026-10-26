@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use okc_core::{ToolCall, ToolExecutor, ToolOutcome, ToolSchema};
 use tracing::{debug, warn};

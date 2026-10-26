@@ -37,13 +37,17 @@ async fn main() -> Result<()> {
             },
             "required": ["question"]
         }),
-        Box::new(|args| Box::pin(async move {
-            let q = args["question"].as_str().ok_or_else(|| anyhow!("question required"))?;
-            let jurisdiction = args["jurisdiction"].as_str().unwrap_or("EU");
-            let n = args["n"].as_u64().unwrap_or(3) as usize;
-            let result = check_legal_status(q, jurisdiction, n).await;
-            Ok(json!(result))
-        })),
+        Box::new(|args| {
+            Box::pin(async move {
+                let q = args["question"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("question required"))?;
+                let jurisdiction = args["jurisdiction"].as_str().unwrap_or("EU");
+                let n = args["n"].as_u64().unwrap_or(3) as usize;
+                let result = check_legal_status(q, jurisdiction, n).await;
+                Ok(json!(result))
+            })
+        }),
     );
 
     // ─── fetch_eu_law ─────────────────────────────────────────────────────
@@ -59,13 +63,19 @@ async fn main() -> Result<()> {
             },
             "required": ["source", "identifier"]
         }),
-        Box::new(|args| Box::pin(async move {
-            let source = args["source"].as_str().ok_or_else(|| anyhow!("source required"))?;
-            let identifier = args["identifier"].as_str().ok_or_else(|| anyhow!("identifier required"))?;
-            let language = args["language"].as_str().unwrap_or("EN");
-            let result = fetch_eu_law(source, identifier, language).await;
-            Ok(json!(result))
-        })),
+        Box::new(|args| {
+            Box::pin(async move {
+                let source = args["source"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("source required"))?;
+                let identifier = args["identifier"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("identifier required"))?;
+                let language = args["language"].as_str().unwrap_or("EN");
+                let result = fetch_eu_law(source, identifier, language).await;
+                Ok(json!(result))
+            })
+        }),
     );
 
     // ─── note_legal_finding ───────────────────────────────────────────────
@@ -83,15 +93,23 @@ async fn main() -> Result<()> {
             },
             "required": ["title", "summary", "source_url"]
         }),
-        Box::new(|args| Box::pin(async move {
-            let title = args["title"].as_str().ok_or_else(|| anyhow!("title required"))?;
-            let summary = args["summary"].as_str().ok_or_else(|| anyhow!("summary required"))?;
-            let url = args["source_url"].as_str().ok_or_else(|| anyhow!("source_url required"))?;
-            let jurisdiction = args["jurisdiction"].as_str().unwrap_or("unspecified");
-            let citation = args["citation"].as_str().unwrap_or("");
-            let result = note_finding(title, summary, url, jurisdiction, citation).await;
-            Ok(json!(result))
-        })),
+        Box::new(|args| {
+            Box::pin(async move {
+                let title = args["title"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("title required"))?;
+                let summary = args["summary"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("summary required"))?;
+                let url = args["source_url"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("source_url required"))?;
+                let jurisdiction = args["jurisdiction"].as_str().unwrap_or("unspecified");
+                let citation = args["citation"].as_str().unwrap_or("");
+                let result = note_finding(title, summary, url, jurisdiction, citation).await;
+                Ok(json!(result))
+            })
+        }),
     );
 
     // ─── list_legal_findings ──────────────────────────────────────────────
@@ -104,11 +122,13 @@ async fn main() -> Result<()> {
                 "limit": { "type": "integer", "default": 20 }
             }
         }),
-        Box::new(|args| Box::pin(async move {
-            let limit = args["limit"].as_u64().unwrap_or(20) as usize;
-            let result = list_findings(limit).await;
-            Ok(json!(result))
-        })),
+        Box::new(|args| {
+            Box::pin(async move {
+                let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+                let result = list_findings(limit).await;
+                Ok(json!(result))
+            })
+        }),
     );
 
     server.run().await
@@ -172,7 +192,8 @@ async fn check_legal_status(question: &str, jurisdiction: &str, n: usize) -> Leg
             },
             Err(e) => LegalSource {
                 url: item.url,
-                title: None,
+                // Fall back to the search result's title when the page is unreachable.
+                title: Some(item.title.clone()).filter(|t| !t.is_empty()),
                 excerpt: String::new(),
                 error: Some(e.to_string()),
             },
@@ -223,7 +244,10 @@ async fn fetch_eu_law(source: &str, identifier: &str, language: &str) -> EuLawRe
                 language: language.to_string(),
                 title: None,
                 text: None,
-                error: Some(format!("Unknown source: {}. Try: gdpr-info, ai-act, legislation-gov-uk, eur-lex", source)),
+                error: Some(format!(
+                    "Unknown source: {}. Try: gdpr-info, ai-act, legislation-gov-uk, eur-lex",
+                    source
+                )),
                 disclaimer: DISCLAIMER.to_string(),
             };
         }
@@ -270,7 +294,13 @@ struct LegalFinding {
     citation: String,
 }
 
-async fn note_finding(title: &str, summary: &str, url: &str, jurisdiction: &str, citation: &str) -> serde_json::Value {
+async fn note_finding(
+    title: &str,
+    summary: &str,
+    url: &str,
+    jurisdiction: &str,
+    citation: &str,
+) -> serde_json::Value {
     let _ = ensure_data_dir().await;
     let id = uuid::Uuid::new_v4().to_string();
 
@@ -353,9 +383,10 @@ async fn fetch_and_extract(url: &str) -> Result<(Option<String>, String)> {
 
 fn build_client() -> Result<reqwest::Client> {
     let mut headers = HeaderMap::new();
-    headers.insert(USER_AGENT, HeaderValue::from_static(
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
-    ));
+    headers.insert(
+        USER_AGENT,
+        HeaderValue::from_static("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"),
+    );
     headers.insert("Accept", HeaderValue::from_static("text/html,*/*"));
     reqwest::Client::builder()
         .default_headers(headers)
@@ -421,7 +452,12 @@ async fn search_ddg(query: &str) -> Vec<SearchItem> {
         Err(_) => return Vec::new(),
     };
 
-    let body = match client.get(&url).timeout(std::time::Duration::from_secs(30)).send().await {
+    let body = match client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+    {
         Ok(r) => match r.text().await {
             Ok(b) => b,
             Err(_) => return Vec::new(),
@@ -437,7 +473,10 @@ async fn search_ddg(query: &str) -> Vec<SearchItem> {
 
     for result in doc.select(&result_sel) {
         let title = result
-            .select(&Selector::parse(".result__title").unwrap_or_else(|_| Selector::parse("h2").unwrap()))
+            .select(
+                &Selector::parse(".result__title")
+                    .unwrap_or_else(|_| Selector::parse("h2").unwrap()),
+            )
             .next()
             .map(|e| e.text().collect::<String>().trim().to_string())
             .unwrap_or_default();

@@ -6,8 +6,8 @@ use ratatui::{
     Frame,
 };
 
+use crate::app::{Mode, ScrollEntry};
 use crate::theme::Theme;
-use crate::app::{ScrollEntry, Mode};
 
 pub fn render_chat(
     frame: &mut Frame,
@@ -19,27 +19,44 @@ pub fn render_chat(
 ) {
     let mut lines = Vec::new();
 
-    for entry in scrollback.iter().rev().skip(scroll_offset).take(area.height as usize * 2) {
+    for entry in scrollback
+        .iter()
+        .rev()
+        .skip(scroll_offset)
+        .take(area.height as usize * 2)
+    {
         match entry {
             ScrollEntry::User(text) => {
                 lines.push(Line::from(vec![
-                    Span::styled("> ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "> ",
+                        Style::default()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(text.clone(), Style::default().fg(theme.fg)),
                 ]));
             }
             ScrollEntry::Assistant(text) => {
-                lines.push(Line::from(Span::styled(text.clone(), Style::default().fg(theme.fg))));
+                lines.push(Line::from(Span::styled(
+                    text.clone(),
+                    Style::default().fg(theme.fg),
+                )));
             }
             ScrollEntry::System(text) => {
                 lines.push(Line::from(Span::styled(
                     text.clone(),
-                    Style::default().fg(theme.fg_dim).add_modifier(Modifier::ITALIC),
+                    Style::default()
+                        .fg(theme.fg_dim)
+                        .add_modifier(Modifier::ITALIC),
                 )));
             }
             ScrollEntry::Reasoning(text) => {
                 lines.push(Line::from(Span::styled(
                     format!("[thinking] {}", text),
-                    Style::default().fg(theme.accent_dim).add_modifier(Modifier::ITALIC),
+                    Style::default()
+                        .fg(theme.accent_dim)
+                        .add_modifier(Modifier::ITALIC),
                 )));
             }
             ScrollEntry::ToolCall { name, args } => {
@@ -48,7 +65,11 @@ pub fn render_chat(
                     Style::default().fg(theme.warning),
                 )));
             }
-            ScrollEntry::ToolResult { name, success, result } => {
+            ScrollEntry::ToolResult {
+                name,
+                success,
+                result,
+            } => {
                 let color = if *success { theme.ok } else { theme.error };
                 lines.push(Line::from(Span::styled(
                     format!("[[result: {}]] {}", name, result),
@@ -58,7 +79,9 @@ pub fn render_chat(
             ScrollEntry::Error(text) => {
                 lines.push(Line::from(Span::styled(
                     format!("ERROR: {}", text),
-                    Style::default().fg(theme.error).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme.error)
+                        .add_modifier(Modifier::BOLD),
                 )));
             }
         }
@@ -68,11 +91,14 @@ pub fn render_chat(
     lines.reverse();
 
     let block = Block::default()
-        .title(format!(" openklawc — {}", match mode {
-            Mode::Normal => "NORMAL",
-            Mode::Insert => "INSERT",
-            Mode::Command => "COMMAND",
-        }))
+        .title(format!(
+            " openklawc — {}",
+            match mode {
+                Mode::Normal => "NORMAL",
+                Mode::Insert => "INSERT",
+                Mode::Command => "COMMAND",
+            }
+        ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border));
 

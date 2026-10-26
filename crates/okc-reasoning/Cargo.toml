@@ -8,8 +8,10 @@ rust-version.workspace = true
 
 [dependencies]
 okc-core = { workspace = true }
+okc-config = { workspace = true }
 okc-llm = { workspace = true }
 okc-tool = { workspace = true }
+okc-decision = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
@@ -19,3 +21,8 @@ tracing = { workspace = true }
 async-trait = { workspace = true }
 parking_lot = { workspace = true }
 chrono = { workspace = true }
+regex = { workspace = true }
+futures = { workspace = true }
+toml = { workspace = true }
+serde_yaml = "0.9"
+walkdir = { workspace = true }

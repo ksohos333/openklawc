@@ -6,12 +6,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use okc_core::{ToolCall, ToolExecutor, ToolOutcome, ToolSchema};
 
 /// One MCP client connected over stdio.
 pub struct McpClient {
+    /// Kept alive so the server process is not reaped early.
+    #[allow(dead_code)]
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
@@ -30,6 +32,8 @@ struct JsonRpcRequest<'a> {
 
 #[derive(Deserialize)]
 struct JsonRpcResponse {
+    /// Correlates the response with its request.
+    #[allow(dead_code)]
     id: u64,
     result: Option<Value>,
     error: Option<JsonRpcError>,
@@ -51,17 +55,27 @@ pub struct McpTool {
 }
 
 impl McpClient {
-    pub async fn spawn(
+    pub async fn spawn(server_name: &str, command: &str, args: &[String]) -> Result<Self> {
+        Self::spawn_with_env(server_name, command, args, &[]).await
+    }
+
+    /// Spawn an MCP server and pass extra environment variables to it.
+    pub async fn spawn_with_env(
         server_name: &str,
         command: &str,
         args: &[String],
+        env: &[(String, String)],
     ) -> Result<Self> {
-        let mut child = Command::new(command)
-            .args(args)
+        let mut cmd = Command::new(command);
+        cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("failed to spawn MCP '{}'", server_name))?;
 
@@ -83,9 +97,10 @@ impl McpClient {
             tools: Vec::new(),
         };
 
-        client.initialize().await.with_context(|| {
-            format!("MCP '{}' initialize handshake failed", server_name)
-        })?;
+        client
+            .initialize()
+            .await
+            .with_context(|| format!("MCP '{}' initialize handshake failed", server_name))?;
 
         // List tools immediately so we know what's available
         match client.list_tools_raw().await {
@@ -165,18 +180,28 @@ impl McpClient {
         self.stdout.read_line(&mut response_line).await?;
 
         if response_line.trim().is_empty() {
-            anyhow::bail!("MCP '{}' returned empty response for {}", self.server_name, method);
+            anyhow::bail!(
+                "MCP '{}' returned empty response for {}",
+                self.server_name,
+                method
+            );
         }
 
         let resp: JsonRpcResponse = serde_json::from_str(&response_line)
             .with_context(|| format!("parsing JSON-RPC response for {}", method))?;
 
         if let Some(err) = resp.error {
-            anyhow::bail!("MCP '{}' error in {}: {} (code {})",
-                self.server_name, method, err.message, err.code);
+            anyhow::bail!(
+                "MCP '{}' error in {}: {} (code {})",
+                self.server_name,
+                method,
+                err.message,
+                err.code
+            );
         }
 
-        resp.result.ok_or_else(|| anyhow!("MCP '{}' response missing result", self.server_name))
+        resp.result
+            .ok_or_else(|| anyhow!("MCP '{}' response missing result", self.server_name))
     }
 
     async fn send_no_reply(&mut self, method: &str, params: &Value) -> Result<()> {
@@ -198,7 +223,7 @@ impl ToolExecutor for McpClient {
         Ok(self.tools.clone())
     }
 
-    async fn execute_tool(&self, call: &ToolCall) -> Result<ToolOutcome> {
+    async fn execute_tool(&self, _call: &ToolCall) -> Result<ToolOutcome> {
         // NOTE: This requires &mut self but the trait uses &self.
         // In practice, the registry wraps this in an Arc<Mutex<>> or similar.
         // For now, we return an error indicating this needs to be called through the registry.

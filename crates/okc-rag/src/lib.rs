@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use regex::Regex;
 
 #[derive(Debug, Clone)]
 pub struct Chunk {
