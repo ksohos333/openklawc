@@ -23,6 +23,7 @@ A roadmap to evolve OpenKLawc from its current v0.2 foundation into a robust, po
 - [x] **Decision metadata extraction** — parse confidence, chosen_approach, alternatives, key_tradeoff
 - [x] **Confidence-driven backtracking** — low-confidence plans trigger reconsideration
 - [x] **Laya decision orchestrator** (`okc-decision` crate)
+  - Crate built and unit-tested, but **unreachable at runtime** — `with_decision_layer` is never called and there is no `[decision]` config section. Wiring lands with the okc-app extraction (P1).
   - HTTP client for Ollaya daemon (`/v1/systemone`)
   - Plan validation before tool execution
   - Intent classification on user messages
@@ -48,7 +49,7 @@ A roadmap to evolve OpenKLawc from its current v0.2 foundation into a robust, po
 - [x] **Retry with exponential backoff** — transient failures auto-retry up to `N` times with 2^n delay
 - [x] **Tool choice strategies** — `auto` | `required` | `none` (config-driven)
 - [x] **Tool result summarization** — long outputs (>4k chars) summarized by LLM before feedback
-- [x] **Configuration-driven behavior** — all execution parameters in `config.toml`
+- [ ] **Configuration-driven behavior** — runtime honors defaults, but file values never arrive: `Agent::with_config` has no callers, so `[orchestrator]` in config is parsed then ignored. Fixed in the okc-app extraction (P1).
   - `tool_choice`, `max_iterations`, `parallel_tools`
   - `retry_count`, `retry_delay_ms`
   - `summarize_results`, `summarize_threshold`
@@ -116,11 +117,11 @@ A roadmap to evolve OpenKLawc from its current v0.2 foundation into a robust, po
   - Pre-defined personas: `architect`, `reviewer`, `tester`, `security_auditor`
   - Custom personas via `config.toml`
   - Persona-specific system prompts and tool access
-- [x] **Multi-agent delegation**
+- [ ] **Multi-agent delegation** — `delegate.rs` exists but is unreachable: no CLI flag, TUI command, or tool reaches it
   - Parent agent delegates subtasks to child agents
   - Child agents run in isolated contexts with limited tools
   - Results are aggregated back to the parent
-- [x] **Workflow engine** — scripted agent pipelines
+- [ ] **Workflow engine** — `workflow.rs` parses YAML/TOML but the executor is a stub that never runs tools or LLM calls
   - YAML / TOML workflow definitions
   - Sequential steps, parallel branches, conditional logic
   - Example: `code_review.yaml` → read → analyze → comment → approve/reject
@@ -223,7 +224,16 @@ The orchestrator uses Laya as a **fast filter**: if Laya says "low confidence" o
 - [x] Phase 2: Advanced Agent Loop complete (parallel tools, retries, summarization, tool choice)
 - [x] Phase 3: Context & Memory complete (persistence, RAG, project awareness, custom tools)
 - [x] Bundled MCP servers complete (filesystem, brave-search, playwright, vision, local-brain, laya)
-- [x] Phase 4 (part): Multi-Agent (personas, workflows, delegation) + chat picker
-- [x] Autonomy gate enforced — mutating tools need real approval in the TUI
+- [x] Phase 4 (part): personas + chat picker are real; delegation and workflows are written but unwired
+- [x] Autonomy gate enforced — mutating tools need real approval in the TUI (name-based only; custom/MCP mutation tools bypass it until the policy engine, P2)
 - [x] Token accounting — providers report usage, sessions track tokens and cost
 - [ ] Phase 5: Production (verification, policies, observability, plugins)
+
+## Known issues (audited 2026-10)
+
+- Fenced JSON tool calls used to execute **twice** (fresh ids defeated the dedup guard) — fixed with (name, arguments) dedup
+- Text-fallback path (Ollama / llama.cpp) double-printed the reply, raw JSON included — fixed
+- `[mcp.<name>] env` values now resolve `{file:}` / `{env:}` secrets; previously the placeholder shipped literally
+- Relative `[mcp.<name>] command` paths anchor to the config file's directory
+- No DB migration mechanism — `PRAGMA user_version` ladder lands with the audit trail (P3)
+- Local inference is migrating to llama.cpp (`llama-server` at 127.0.0.1:8080, OpenAI-compatible); Ollama provider is being removed (P5)

@@ -335,7 +335,10 @@ impl Orchestrator {
                     }
                 };
                 let filtered = okc_core::util::filter_filler_phrases(&text);
-                self.emit(AgentUpdate::TextChunk(filtered.clone()));
+                // The response text is emitted once, below, from the cleaned
+                // output. Emitting it here as well showed text-fallback
+                // (Ollama / llama.cpp) users the reply twice — the first
+                // copy still containing the raw tool JSON.
                 okc_core::parse_tool_calls_native(&filtered)
             };
 

@@ -732,25 +732,39 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
     for cap in fence_re.captures_iter(text) {
         let json_str = &cap[1];
         if let Some(call) = try_parse_tool_json(json_str) {
-            tool_calls.push(call);
-            cleaned = cleaned.replace(&cap[0], "");
-        }
-    }
-
-    // Try inline JSON objects
-    let inline_re = regex::Regex::new(r"\{(?:[^{}]|\{[^{}]*\})*\}").unwrap();
-    for cap in inline_re.captures_iter(text) {
-        let json_str = &cap[0];
-        if let Some(call) = try_parse_tool_json(json_str) {
-            // Don't duplicate
-            if !tool_calls.iter().any(|c: &ToolCall| c.id.0 == call.id.0) {
+            if !same_call_seen(&tool_calls, &call) {
                 tool_calls.push(call);
                 cleaned = cleaned.replace(&cap[0], "");
             }
         }
     }
 
+    // Try inline JSON objects. This runs over the text with fenced blocks
+    // already removed, so a fenced tool call is never matched — and
+    // executed — a second time.
+    let inline_re = regex::Regex::new(r"\{(?:[^{}]|\{[^{}]*\})*\}").unwrap();
+    let inline_matches: Vec<String> = inline_re
+        .captures_iter(&cleaned)
+        .map(|cap| cap[0].to_string())
+        .collect();
+    for json_str in &inline_matches {
+        if let Some(call) = try_parse_tool_json(json_str) {
+            if !same_call_seen(&tool_calls, &call) {
+                tool_calls.push(call);
+                cleaned = cleaned.replace(json_str, "");
+            }
+        }
+    }
+
     (cleaned.trim().to_string(), tool_calls)
+}
+
+/// True when an identical (name, arguments) call is already collected.
+/// Call ids are freshly minted per parse, so they can't be used for
+/// deduplication.
+fn same_call_seen(seen: &[ToolCall], call: &ToolCall) -> bool {
+    seen.iter()
+        .any(|c| c.name == call.name && c.arguments == call.arguments)
 }
 
 fn try_parse_tool_json(json_str: &str) -> Option<ToolCall> {
@@ -820,4 +834,53 @@ pub enum FileChangeKind {
     Remove,
     Modify,
     Rename,
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    #[test]
+    fn fenced_tool_json_executes_once() {
+        // Regression: the inline pass used to re-match the JSON inside the
+        // fence on the original text, executing the tool twice.
+        let text = "Let me read that file.\n```json\n{\"tool\":\"read_file\",\"arguments\":{\"path\":\"src/main.rs\"}}\n```";
+        let (clean, calls) = parse_tool_calls(text);
+        assert_eq!(
+            calls.len(),
+            1,
+            "fenced call must not be double-counted: {:?}",
+            calls
+        );
+        assert_eq!(calls[0].name, "read_file");
+        assert!(!clean.contains("read_file"), "tool JSON must be stripped");
+    }
+
+    #[test]
+    fn inline_tool_json_parses_once() {
+        let text = "Reading now {\"tool\":\"read_file\",\"arguments\":{\"path\":\"a.rs\"}} thanks";
+        let (clean, calls) = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert!(!clean.contains("\"tool\""));
+    }
+
+    #[test]
+    fn identical_repeated_calls_dedup() {
+        let text = "{\"tool\":\"list_dir\",\"arguments\":{\"path\":\".\"}} {\"tool\":\"list_dir\",\"arguments\":{\"path\":\".\"}}";
+        let (_, calls) = parse_tool_calls(text);
+        assert_eq!(
+            calls.len(),
+            1,
+            "identical repeated calls are echo, not intent: {:?}",
+            calls
+        );
+    }
+
+    #[test]
+    fn plain_text_yields_no_calls() {
+        let (clean, calls) = parse_tool_calls("Just a normal answer, no tools.");
+        assert!(calls.is_empty());
+        assert_eq!(clean, "Just a normal answer, no tools.");
+    }
 }

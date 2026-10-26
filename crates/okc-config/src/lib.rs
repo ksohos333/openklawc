@@ -381,14 +381,20 @@ impl Config {
 
         if let Some(user_cfg) = Self::user_config_path() {
             if user_cfg.exists() {
-                merged = merge_tables(merged, Self::load_toml(&user_cfg)?);
+                let mut value = Self::load_toml(&user_cfg)?;
+                if let Some(dir) = user_cfg.parent() {
+                    anchor_mcp_commands(&mut value, dir);
+                }
+                merged = merge_tables(merged, value);
             }
         }
 
         if let Ok(cwd) = std::env::current_dir() {
             let local = cwd.join(".openklawc.toml");
             if local.exists() {
-                merged = merge_tables(merged, Self::load_toml(&local)?);
+                let mut value = Self::load_toml(&local)?;
+                anchor_mcp_commands(&mut value, &cwd);
+                merged = merge_tables(merged, value);
             }
         }
 
@@ -419,9 +425,41 @@ impl Config {
     }
 
     /// Replace `{file:path}` / `{env:VAR}` references with real values.
+    /// Applies to provider API keys and to `[mcp.<name>] env` values, so a
+    /// `BRAVE_API_KEY = "{file:...}"` entry reaches the child process
+    /// resolved instead of shipping the placeholder literally.
     pub fn resolve_secrets(&mut self) {
         for provider in self.provider.values_mut() {
             provider.api_key = resolve_secret(&provider.api_key);
+        }
+        for server in self.mcp.values_mut() {
+            for value in server.env.values_mut() {
+                *value = resolve_secret(value);
+            }
+        }
+    }
+}
+
+/// Anchor relative `mcp.<name>.command` paths to the directory of the
+/// config file that defined them. A project-local
+/// `command = "./target/release/mcp-x"` keeps working when openklawc is
+/// started from another directory; absolute commands pass through
+/// untouched.
+fn anchor_mcp_commands(value: &mut toml::Value, base_dir: &std::path::Path) {
+    let Some(mcp) = value.get_mut("mcp").and_then(|m| m.as_table_mut()) else {
+        return;
+    };
+    for (_, server) in mcp.iter_mut() {
+        let Some(entry) = server.as_table_mut() else {
+            continue;
+        };
+        if let Some(cmd_value) = entry.get_mut("command") {
+            if let toml::Value::String(cmd) = cmd_value {
+                if !cmd.is_empty() && std::path::Path::new(cmd.as_str()).is_relative() {
+                    let joined = base_dir.join(cmd.as_str()).to_string_lossy().to_string();
+                    *cmd = joined;
+                }
+            }
         }
     }
 }
@@ -473,4 +511,67 @@ fn resolve_secret(raw: &str) -> String {
     }
 
     trimmed.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_env_secrets_are_resolved() {
+        let mut cfg = Config::default();
+        cfg.mcp.insert(
+            "probe".to_string(),
+            McpServerConfig {
+                command: "/bin/true".to_string(),
+                args: vec![],
+                env: [
+                    ("API".to_string(), "{env:OKC_TEST_SECRET_VAR}".to_string()),
+                    ("PLAIN".to_string(), "literal".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                sse_url: None,
+                enabled: true,
+            },
+        );
+
+        std::env::set_var("OKC_TEST_SECRET_VAR", "s3cr3t-value");
+        cfg.resolve_secrets();
+
+        let probe = &cfg.mcp["probe"];
+        assert_eq!(probe.env["API"], "s3cr3t-value");
+        assert_eq!(probe.env["PLAIN"], "literal");
+    }
+
+    #[test]
+    fn relative_mcp_commands_are_anchored_to_the_config_dir() {
+        let raw = r#"
+            [mcp.anticonf]
+            command = "./target/release/mcp-anticonf"
+
+            [mcp.absolute]
+            command = "/usr/local/bin/mcp-x"
+        "#;
+        let mut value: toml::Value = toml::from_str(raw).unwrap();
+        anchor_mcp_commands(&mut value, std::path::Path::new("/home/user/proj"));
+
+        let mcp = value.get("mcp").unwrap().as_table().unwrap();
+        assert_eq!(
+            mcp["anticonf"]["command"].as_str().unwrap(),
+            "/home/user/proj/./target/release/mcp-anticonf"
+        );
+        assert_eq!(
+            mcp["absolute"]["command"].as_str().unwrap(),
+            "/usr/local/bin/mcp-x"
+        );
+    }
+
+    #[test]
+    fn config_without_mcp_table_anchors_nothing() {
+        let mut value: toml::Value = toml::from_str("model = \"x/y\"").unwrap();
+        anchor_mcp_commands(&mut value, std::path::Path::new("/anywhere"));
+        // No panic, value untouched.
+        assert_eq!(value.get("model").unwrap().as_str().unwrap(), "x/y");
+    }
 }
