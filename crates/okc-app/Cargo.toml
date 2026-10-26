@@ -15,6 +15,7 @@ okc-reasoning = { workspace = true }
 okc-session = { workspace = true }
 okc-rag = { workspace = true }
 okc-tool = { workspace = true }
+okc-policy = { workspace = true }
 
 tokio = { workspace = true }
 anyhow = { workspace = true }

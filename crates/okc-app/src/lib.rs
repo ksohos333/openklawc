@@ -21,6 +21,7 @@ use okc_config::{Config, ModelPricing};
 use okc_core::{AutonomyLevel, ChatMessage, EventBus, TokenUsage, ToolCall, ToolExecutor, ToolOutcome, ToolSchema};
 use okc_llm::{LlmClient, ProviderRegistry};
 use okc_mcp::McpRegistry;
+use okc_policy::PolicyExecutor;
 use okc_rag::SimpleRag;
 use okc_reasoning::{Agent, AgentUpdate, ConfirmRequest};
 use okc_session::{SessionConfig, SessionStore};
@@ -124,10 +125,35 @@ impl App {
                 Err(e) => mcp_failures.push(format!("registry: {}", e)),
             }
         }
-        // Hard per-call timeout around the whole executor, so a hung MCP
-        // server can no longer wedge the agent loop forever.
+        // Persona (built once — its tool restriction also feeds policy).
+        let persona = build_persona(opts.persona.as_deref(), &cfg);
+        let persona_allowed = persona
+            .as_ref()
+            .map(|p| p.allowed_tools.clone())
+            .filter(|s| !s.is_empty());
+
+        // Extra mutation classification: config-listed tools plus every
+        // custom tool that is not explicitly vouched for with
+        // `mutating = false`. These require approval outside yolo/god.
+        let mut mutation_extra: std::collections::HashSet<String> =
+            cfg.policy.mutating_tools.iter().cloned().collect();
+        for tool in &cfg.tools.custom {
+            if tool.mutating {
+                mutation_extra.insert(tool.name.clone());
+            }
+        }
+
+        // Policy inside the timeout: verdicts return instantly, inner calls
+        // stay bounded. Policy outranks autonomy — a deny is a deny, even
+        // in `god`.
+        let policy = PolicyExecutor::new(
+            Arc::new(composite),
+            &cfg.policy,
+            persona_allowed,
+            event_bus.clone(),
+        );
         let tools: Arc<dyn ToolExecutor> = Arc::new(TimeoutExecutor {
-            inner: Arc::new(composite),
+            inner: Arc::new(policy),
             timeout: Duration::from_millis(cfg.orchestrator.call_timeout_ms),
         });
 
@@ -142,10 +168,11 @@ impl App {
             autonomy,
             event_bus.clone(),
         )
-        .with_config((&cfg.orchestrator).into());
+        .with_config((&cfg.orchestrator).into())
+        .with_mutation_extra(mutation_extra);
 
-        if let Some(persona) = build_persona(opts.persona.as_deref(), &cfg) {
-            agent = agent.with_persona(persona);
+        if let Some(p) = persona {
+            agent = agent.with_persona(p);
         }
 
         // ─── RAG index of the working directory ───────────────────────────

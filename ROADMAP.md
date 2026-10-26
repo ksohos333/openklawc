@@ -146,7 +146,14 @@ A roadmap to evolve OpenKLawc from its current v0.2 foundation into a robust, po
   - Every factual claim is cross-referenced against sources
   - Verification badge in status bar: "verified N / unverified M"
   - Uncertain claims are flagged with `[unverified]` prefix
-- [ ] **Policy engine** — enforceable rules for agent behavior
+- [x] **Policy engine** — enforceable rules for agent behavior
+  (`crates/okc-policy`, ADR-001)
+  - Protected paths (`.env`, `*.key`, `~/.ssh/**`, …) denied at every
+    autonomy level, including `god`
+  - Root sandbox for file tools (`[policy] allowed_roots`)
+  - Custom tools mutating by default (`mutating = false` to vouch)
+  - Persona `allowed_tools` enforced at run time
+  - `FileMutation` / `CommandExecuted` events published for the audit trail
   - Disallow certain tools in specific directories
   - Require confirmation for files matching `.env`, `*.key`, `secrets.*`
   - Rate-limit expensive operations (API calls, large file writes)

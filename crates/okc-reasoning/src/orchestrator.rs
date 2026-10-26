@@ -129,6 +129,9 @@ pub struct Orchestrator {
     pub persona: Option<crate::persona::Persona>,
     /// Channel used to ask the user to approve a tool call.
     pub confirm_tx: Option<tokio::sync::mpsc::Sender<ConfirmRequest>>,
+    /// Extra tool names classified as mutating (extends
+    /// `okc_core::is_mutation_tool`).
+    pub mutation_extra: std::collections::HashSet<String>,
 }
 
 impl Orchestrator {
@@ -156,6 +159,7 @@ impl Orchestrator {
             config: OrchestratorConfig::default(),
             persona: None,
             confirm_tx: None,
+            mutation_extra: std::collections::HashSet::new(),
         }
     }
 
@@ -498,6 +502,13 @@ impl Orchestrator {
             };
             let any_failed = results.iter().any(|r| r.is_error);
 
+            // Feed results back in the provider's native format FIRST.
+            // Anthropic-family APIs reject a tool_use that is not followed
+            // by its tool_result ("tool call result does not follow tool
+            // call", error 2013), so results must land in the history even
+            // when the turn backtracks.
+            self.append_tool_results(&mut messages, &results).await;
+
             // ─── Backtracking on failure ──────────────────────────────────
             if any_failed && self.backtrack_count < self.max_backtracks {
                 self.backtrack_count += 1;
@@ -533,9 +544,6 @@ impl Orchestrator {
                 turn.phase = TurnPhase::Reflecting;
                 continue; // Loop again with the backtrack prompt
             }
-
-            // Feed results back in the provider's native format
-            self.append_tool_results(&mut messages, &results).await;
 
             turn.phase = TurnPhase::Reflecting;
         }
@@ -687,7 +695,8 @@ impl Orchestrator {
     /// The approval prompt happens *before* the retry loop: a declined call is
     /// a decision, not a transient failure, so it must not be re-asked.
     async fn execute_native_tool_with_retry(&self, call: &NativeToolCall) -> NativeToolResult {
-        let is_mutation = okc_core::is_mutation_tool(&call.name);
+        let is_mutation = okc_core::is_mutation_tool(&call.name)
+            || self.mutation_extra.contains(&call.name);
         if self.autonomy.needs_confirm(&call.name, is_mutation) {
             match self.await_confirmation(call).await {
                 ConfirmOutcome::Approved => {}

@@ -1,0 +1,19 @@
+[package]
+name = "okc-policy"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+okc-core = { workspace = true }
+okc-config = { workspace = true }
+
+tokio = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+glob = { workspace = true }
+shellexpand = { workspace = true }

@@ -58,6 +58,15 @@ args = []
 [autonomy]
 default_level = "yolo"
 
+# ─── Policy ───────────────────────────────────────────────────────────────────
+# Policy outranks autonomy: a deny is denied in every level, including god.
+# Defaults are sensible; uncomment to extend.
+#
+# [policy]
+# protected_paths = ["*.tfstate", "~/vault/**"]   # added on top of defaults
+# allowed_roots = ["$CWD", "~/code"]              # replaces the default roots
+# mutating_tools = ["browser_fill_form"]          # extra approval-gated tools
+
 [orchestrator]
 # How the model chooses tools: "auto" | "required" | "none"
 tool_choice = "auto"

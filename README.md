@@ -182,7 +182,36 @@ that needs approval is denied — pass `--autonomy yolo` to allow it.
 
 `read_file`, `list_directory`, `search_files` and friends are reads.
 `write_file`, `edit_file`, `create_directory`, `move_file`, `shell` and `git`
-are mutations and always need approval outside `yolo`/`god`.
+are mutations and always need approval outside `yolo`/`god`. Custom tools
+(`[[tools.custom]]`) are **mutating by default**; vouch for a read-only one
+with `mutating = false`.
+
+## Policy
+
+Autonomy decides when to **ask**; policy decides what is **permitted at
+all**. Policy outranks autonomy — a policy deny is denied in every level,
+including `god`. See `docs/adr/001-approval-policy-boundary.md`.
+
+```toml
+[policy]
+# Path globs that are always off-limits (any autonomy level).
+# Defaults: .env, *.env, *.key, *.pem, *.pfx, secrets.*,
+#           ~/.ssh/**, ~/.gnupg/**, ~/.config/opencode/keys/**
+# protected_paths = ["*.tfstate", "~/vault/**"]
+
+# Roots the file tools may touch. $CWD = working directory at boot.
+# Defaults: $CWD, ~/.local/share/openklawc, ~/.config/openklawc
+# allowed_roots = ["$CWD", "~/code"]
+
+# Extra tool names treated as mutating (approval outside yolo/god) —
+# e.g. MCP tools that write.
+# mutating_tools = ["browser_fill_form"]
+```
+
+Denials come back to the model as ordinary tool errors naming the rule
+(`policy: '~/.ssh/id_rsa' is a protected path`), so the agent can adapt.
+When a persona restricts its `allowed_tools`, that restriction is enforced
+at run time too — not just hidden from the prompt.
 
 ## Agent Loop
 

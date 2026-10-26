@@ -1591,6 +1591,7 @@ dependencies = [
  "okc-core",
  "okc-llm",
  "okc-mcp",
+ "okc-policy",
  "okc-rag",
  "okc-reasoning",
  "okc-session",
@@ -1708,6 +1709,21 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "okc-policy"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "glob",
+ "okc-config",
+ "okc-core",
+ "serde_json",
+ "shellexpand",
  "tokio",
  "tracing",
 ]

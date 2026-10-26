@@ -56,6 +56,9 @@ pub struct Config {
     /// (`minimax/MiniMax-M3`). Models without an entry report an unknown cost.
     #[serde(default)]
     pub pricing: HashMap<String, ModelPricing>,
+    /// Enforceable rules for agent behaviour (see `PolicyConfig`).
+    #[serde(default)]
+    pub policy: PolicyConfig,
 }
 
 /// Token pricing for one model, in US dollars per million tokens.
@@ -214,6 +217,67 @@ pub struct CustomToolDef {
     pub timeout: u64,
     #[serde(default = "true_fn")]
     pub fail_on_error: bool,
+    /// Whether this tool mutates anything. Custom tools run shell commands,
+    /// so they default to TRUE: they require approval outside `yolo`/`god`
+    /// unless explicitly vouched for with `mutating = false`.
+    #[serde(default = "true_fn")]
+    pub mutating: bool,
+}
+
+/// Enforceable rules for agent behaviour.
+///
+/// Policy composes with, and outranks, autonomy: autonomy decides when to
+/// ASK, policy decides what is PERMITTED at all. A policy deny stays denied
+/// in every autonomy level, including `god`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyConfig {
+    /// Path globs that are always off-limits (hard deny at any autonomy
+    /// level). `~` expands. Basename patterns like `*.key` match in any
+    /// directory.
+    #[serde(default = "default_protected_paths")]
+    pub protected_paths: Vec<String>,
+    /// Directory roots the file tools may touch. `$CWD` resolves to the
+    /// working directory at boot; `~` expands. Paths outside a root are
+    /// denied. Empty means "no sandbox".
+    #[serde(default = "default_allowed_roots")]
+    pub allowed_roots: Vec<String>,
+    /// Extra tool names treated as mutating — they require approval outside
+    /// `yolo`/`god`. Use this for MCP tools that write but are not named
+    /// `write_file`/`edit_file`/`create_directory`/`move_file`.
+    #[serde(default)]
+    pub mutating_tools: Vec<String>,
+}
+
+fn default_protected_paths() -> Vec<String> {
+    vec![
+        ".env".to_string(),
+        "*.env".to_string(),
+        "*.key".to_string(),
+        "*.pem".to_string(),
+        "*.pfx".to_string(),
+        "secrets.*".to_string(),
+        "~/.ssh/**".to_string(),
+        "~/.gnupg/**".to_string(),
+        "~/.config/opencode/keys/**".to_string(),
+    ]
+}
+
+fn default_allowed_roots() -> Vec<String> {
+    vec![
+        "$CWD".to_string(),
+        "~/.local/share/openklawc".to_string(),
+        "~/.config/openklawc".to_string(),
+    ]
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            protected_paths: default_protected_paths(),
+            allowed_roots: default_allowed_roots(),
+            mutating_tools: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -389,6 +453,7 @@ impl Default for Config {
             personas: HashMap::new(),
             default_persona: None,
             pricing: HashMap::new(),
+            policy: PolicyConfig::default(),
         }
     }
 }

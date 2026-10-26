@@ -93,3 +93,47 @@ async fn unknown_explicit_model_is_a_boot_error() {
 
     assert!(result.is_err(), "explicit unknown model must error at boot");
 }
+
+#[tokio::test]
+async fn policy_is_active_at_the_booted_executor_seam() {
+    let mut registry = ProviderRegistry::new();
+    registry.register("mock", Arc::new(EchoProvider), vec!["echo-1".to_string()]);
+
+    // God mode: the most permissive autonomy. Policy must still hold.
+    let (app, _boot) = App::boot_with(
+        AppOptions {
+            model: Some("mock/echo-1".to_string()),
+            autonomy: Some(AutonomyLevel::God),
+            start_mcp: false,
+            ..Default::default()
+        },
+        Some(registry),
+    )
+    .await
+    .expect("boot");
+
+    use okc_core::{ToolCall, ToolExecutor};
+
+    // Protected path — denied even in god mode.
+    let call = ToolCall {
+        id: okc_core::Id::new(),
+        name: "write_file".to_string(),
+        arguments: serde_json::json!({"path": "~/.ssh/authorized_keys", "content": "x"}),
+    };
+    let out = app.tools.execute_tool(&call).await.unwrap();
+    assert!(
+        !out.success,
+        "protected path must be denied even in god mode"
+    );
+    assert!(out.error.unwrap().contains("protected"));
+
+    // Sandbox — outside allowed roots denied.
+    let call = ToolCall {
+        id: okc_core::Id::new(),
+        name: "read_file".to_string(),
+        arguments: serde_json::json!({"path": "/etc/passwd"}),
+    };
+    let out = app.tools.execute_tool(&call).await.unwrap();
+    assert!(!out.success, "out-of-root read must be denied");
+    assert!(out.error.unwrap().contains("allowed roots"));
+}

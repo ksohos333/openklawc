@@ -12,6 +12,7 @@ members = [
     "crates/okc-rag",
     "crates/okc-git",
     "crates/okc-plugin",
+    "crates/okc-policy",
     "crates/okc-app",
     "crates/mcp-web-research",
     "crates/mcp-anticonf",
@@ -73,6 +74,7 @@ okc-decision = { path = "crates/okc-decision" }
 okc-rag = { path = "crates/okc-rag" }
 okc-git = { path = "crates/okc-git" }
 okc-plugin = { path = "crates/okc-plugin" }
+okc-policy = { path = "crates/okc-policy" }
 okc-app = { path = "crates/okc-app" }
 
 # Utilities

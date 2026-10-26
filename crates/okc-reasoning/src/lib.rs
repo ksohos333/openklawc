@@ -93,6 +93,10 @@ pub struct Agent {
     /// When `None` there is nobody to ask, so calls that need approval are
     /// denied rather than silently executed.
     pub confirm_tx: Option<mpsc::Sender<ConfirmRequest>>,
+    /// Extra tool names classified as mutating (custom tools, configured
+    /// MCP tools). Extends `okc_core::is_mutation_tool`, so these require
+    /// approval outside `yolo`/`god`.
+    pub mutation_extra: std::collections::HashSet<String>,
 }
 
 impl Agent {
@@ -119,6 +123,7 @@ impl Agent {
             config: crate::orchestrator::OrchestratorConfig::default(),
             persona: None,
             confirm_tx: None,
+            mutation_extra: std::collections::HashSet::new(),
         }
     }
 
@@ -138,6 +143,14 @@ impl Agent {
     /// Set an active persona.
     pub fn with_persona(mut self, persona: crate::persona::Persona) -> Self {
         self.persona = Some(persona);
+        self
+    }
+
+    /// Extend the mutation classification with extra tool names (custom
+    /// tools, configured MCP tools). These then require approval outside
+    /// `yolo`/`god` exactly like the built-in mutating tools.
+    pub fn with_mutation_extra(mut self, names: std::collections::HashSet<String>) -> Self {
+        self.mutation_extra = names;
         self
     }
 
@@ -162,6 +175,7 @@ impl Agent {
             config: self.config.clone(),
             persona: self.persona.clone(),
             confirm_tx: self.confirm_tx.clone(),
+            mutation_extra: self.mutation_extra.clone(),
         }
     }
 
@@ -187,6 +201,7 @@ impl Agent {
             config: self.config.clone(),
             persona: self.persona.clone(),
             confirm_tx: self.confirm_tx.clone(),
+            mutation_extra: self.mutation_extra.clone(),
         };
 
         let new_messages = orch.run_turn(user_input, messages).await;

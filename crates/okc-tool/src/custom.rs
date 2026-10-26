@@ -163,6 +163,7 @@ mod tests {
             cwd: None,
             timeout: 5,
             fail_on_error: true,
+            mutating: true,
         });
 
         let schema = custom.list_tools().await.unwrap();
