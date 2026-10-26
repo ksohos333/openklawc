@@ -183,6 +183,18 @@ pub fn extract_decision_metadata(text: &str) -> okc_core::DecisionMetadata {
     meta
 }
 
+/// Prompt section used when the anticonf observation tool is loaded: asks
+/// the agent to note factual claims with their source status, which feeds
+/// the status-bar verification badge.
+pub fn claim_verification_prompt() -> String {
+    "\n# Claim Verification\n\
+     When you state a factual claim, record it with the `note_observation` tool:\n\
+     - source_kind=\"verified\" when a source you consulted backs the claim (pass its URL in source_url)\n\
+     - source_kind=\"unverified\" when the claim comes from your own knowledge with no consulted source\n\
+     Keep observations one line and factual. This feeds the verified/unverified counter in the UI.\n"
+        .to_string()
+}
+
 /// Format a list of tool schemas into a human-readable description block.
 pub fn format_tool_descriptions(tools: &[okc_core::ToolSchema]) -> String {
     let mut out = String::new();

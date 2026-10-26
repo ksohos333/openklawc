@@ -240,6 +240,24 @@ back the file up beside the original before touching it
 
 Logs are structured JSON on stderr (`RUST_LOG` controls the level).
 
+## Claim Verification
+
+When the `anticonf` MCP server is loaded, the agent is instructed to note
+factual claims with `note_observation` as it makes them:
+
+- `source_kind = "verified"` — a consulted source backs the claim (its URL
+  goes in `source_url`)
+- `source_kind = "unverified"` — the claim comes from the model's own
+  knowledge
+
+The status bar shows the running tally for the session —
+`claims: 2/1` (verified in green / unverified in red) — recomputed after
+every turn from the audit trail. Honest scope: this is evidence-gathering
+plus self-reporting, not proof; `verify_claim` fetches raw source text and
+the verdict stays with the model and the human. Observations live in
+`~/.local/share/anticonf/data/observations.jsonl` (legacy records without
+timestamps are read leniently).
+
 ## Agent Loop
 
 The agent loop (Hermes-inspired):

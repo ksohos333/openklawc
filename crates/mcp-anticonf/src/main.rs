@@ -192,7 +192,10 @@ async fn verify_claim(claim: &str, source_urls: Vec<String>) -> VerifyResult {
 #[derive(Debug, Serialize, Deserialize)]
 struct Observation {
     fact_id: String,
-    timestamp: String,
+    /// RFC3339. Legacy records (pre-v0.2 rewrite) used `logged_at` and
+    /// carry no timestamp — tolerated as `None` so old data stays readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timestamp: Option<String>,
     observation: String,
     source_url: String,
     source_kind: String,
@@ -204,7 +207,7 @@ async fn note_observation(obs: &str, url: &str, kind: &str) -> serde_json::Value
 
     let entry = Observation {
         fact_id: id.clone(),
-        timestamp: Utc::now().to_rfc3339(),
+        timestamp: Some(Utc::now().to_rfc3339()),
         observation: obs.to_string(),
         source_url: url.to_string(),
         source_kind: kind.to_string(),
@@ -253,6 +256,31 @@ async fn list_observations(limit: usize) -> Vec<Observation> {
     obs.reverse();
     obs.truncate(limit);
     obs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_records_without_timestamp_parse() {
+        // Actual legacy record from this machine's observations.jsonl
+        // (pre-v0.2 schema: logged_at + confidence, no timestamp).
+        let legacy = r#"{"fact_id":"fact_1792183581317_ollama:__dmtx_qwen3.5-9b","observation":"LLM-extracted JSON: {\"translation\": \"cats\"}","source_url":"ollama://dmtx/qwen3.5-9b-abliterated:latest","source_kind":"model-claim","confidence":"medium","logged_at":1792183581.3178005}"#;
+        let o: Observation = serde_json::from_str(legacy).unwrap();
+        assert_eq!(o.source_kind, "model-claim");
+        assert!(o.timestamp.is_none());
+    }
+
+    #[test]
+    fn current_records_round_trip() {
+        let cur = r#"{"fact_id":"f2","timestamp":"2026-10-26T12:00:00+00:00","observation":"x","source_url":"https://y","source_kind":"web"}"#;
+        let o: Observation = serde_json::from_str(cur).unwrap();
+        assert_eq!(o.timestamp.as_deref(), Some("2026-10-26T12:00:00+00:00"));
+        // Serialization keeps the current shape (timestamp present).
+        let out = serde_json::to_string(&o).unwrap();
+        assert!(out.contains("\"timestamp\""));
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════

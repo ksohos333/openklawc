@@ -142,10 +142,12 @@ A roadmap to evolve OpenKLawc from its current v0.2 foundation into a robust, po
 **Goal**: Transform OpenKLawc into a production-grade, trustable agent harness.
 
 ### Deliverables
-- [ ] **Anti-confabulation verification** (`anticonf` integration)
-  - Every factual claim is cross-referenced against sources
-  - Verification badge in status bar: "verified N / unverified M"
-  - Uncertain claims are flagged with `[unverified]` prefix
+- [x] **Anti-confabulation verification** (`anticonf` integration) — v1, honest scope: evidence-gathering + agent self-reporting
+  - [x] Verification badge in status bar: `claims: N/M` (verified/unverified, per session)
+  - [x] Agent notes claims with sources via `note_observation` (prompt section injected only when the tool is loaded)
+  - [x] Legacy observation records readable again (lenient schema)
+  - [ ] Automatic cross-referencing of every claim against fetched sources (verify_claim returns evidence; the verdict stays with model + human for now)
+  - [ ] `[unverified]` inline prefix on uncertain claims in the scrollback
 - [x] **Policy engine** — enforceable rules for agent behavior
   (`crates/okc-policy`, ADR-001)
   - Protected paths (`.env`, `*.key`, `~/.ssh/**`, …) denied at every

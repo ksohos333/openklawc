@@ -88,6 +88,9 @@ pub struct App {
     pub current_session_id: Option<String>,
     pub token_count: usize,
     pub iteration_count: usize,
+    /// Verified / unverified claim counts for the current session, fed by
+    /// the anticonf audit trail. `None` until a session starts.
+    pub verify_badge: Option<(usize, usize)>,
 
     // ─── Chat picker ───────────────────────────────────────────────────────
     pub chat_picker: ChatPickerState,
@@ -139,6 +142,7 @@ impl App {
             current_session_id: None,
             token_count: 0,
             iteration_count: 0,
+            verify_badge: None,
             chat_picker: ChatPickerState::new(),
             pending_confirm: None,
         };
@@ -210,6 +214,7 @@ impl App {
             &format!("{:?}", self.autonomy).to_lowercase(),
             self.mcp_count,
             self.token_count,
+            self.verify_badge,
             &self.theme,
         );
 

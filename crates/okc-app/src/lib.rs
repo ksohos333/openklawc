@@ -420,6 +420,13 @@ impl App {
         self.session_store.as_ref()?.get_messages(id).ok()
     }
 
+    /// Verified / unverified claim counts for a session, based on the
+    /// `note_observation` calls in its audit trail.
+    pub fn verification_counts(&self, session_id: &str) -> (usize, usize) {
+        let events = self.audit_trail(session_id, 500);
+        count_verifications(&events)
+    }
+
     /// Delete a session. Returns false when the store is down or the id is
     /// unknown.
     pub fn delete_session(&mut self, id: &str) -> bool {
@@ -428,6 +435,39 @@ impl App {
             None => false,
         }
     }
+}
+
+/// Count verified / unverified claims among `note_observation` audit
+/// payloads. An observation is verified when its `source_kind` says so —
+/// the agent's self-report, cross-checked against the sources it passed.
+pub fn count_verifications(events: &[okc_session::AuditEvent]) -> (usize, usize) {
+    let mut verified = 0;
+    let mut unverified = 0;
+    for event in events {
+        if event.kind != "ToolCall" {
+            continue;
+        }
+        let Some(call) = event.payload.get("ToolCall").and_then(|t| t.get("call")) else {
+            continue;
+        };
+        if call.get("name").and_then(|n| n.as_str()) != Some("note_observation") {
+            continue;
+        }
+        let kind = call
+            .get("arguments")
+            .and_then(|a| a.get("source_kind"))
+            .and_then(|k| k.as_str())
+            .unwrap_or("unspecified")
+            .to_lowercase();
+        if kind.contains("unverified") {
+            unverified += 1;
+        } else if kind.contains("verified") {
+            verified += 1;
+        } else {
+            unverified += 1;
+        }
+    }
+    (verified, unverified)
 }
 
 /// Split an event into (kind, session id, payload) for the audit table.
@@ -677,5 +717,44 @@ mod tests {
         let (kind, session_id, _) = flatten_event(&event);
         assert_eq!(kind, "AutonomyChanged");
         assert!(session_id.is_none());
+    }
+
+    fn audit_event(kind: &str, payload: serde_json::Value) -> okc_session::AuditEvent {
+        okc_session::AuditEvent {
+            ts: "t".to_string(),
+            kind: kind.to_string(),
+            payload,
+        }
+    }
+
+    #[test]
+    fn count_verifications_splits_by_source_kind() {
+        let call = |kind: &str| {
+            audit_event(
+                "ToolCall",
+                serde_json::json!({
+                    "ToolCall": { "call": {
+                        "name": "note_observation",
+                        "arguments": { "observation": "x", "source_url": "u", "source_kind": kind }
+                    }}
+                }),
+            )
+        };
+        let other = audit_event(
+            "ToolCall",
+            serde_json::json!({
+                "ToolCall": { "call": { "name": "read_file", "arguments": { "path": "a" } } }
+            }),
+        );
+        let events = vec![
+            call("verified"),
+            call("unverified"),
+            call("web-verified"),
+            call("model-claim"),
+            other,
+        ];
+        let (ok, bad) = count_verifications(&events);
+        assert_eq!(ok, 2, "verified + web-verified");
+        assert_eq!(bad, 2, "unverified + unspecified kind");
     }
 }

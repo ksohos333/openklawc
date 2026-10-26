@@ -293,6 +293,15 @@ impl Orchestrator {
             }
         }
 
+        // Claim verification: instruct only when the anticonf observation
+        // tool is actually loaded — no tool, no nagging.
+        if tool_schemas
+            .iter()
+            .any(|t| t.name == "note_observation")
+        {
+            system_prompt.push_str(&crate::prompt::claim_verification_prompt());
+        }
+
         if messages.is_empty() || messages[0].role != Role::System {
             messages.insert(0, ChatMessage::system(system_prompt));
         } else {

@@ -289,6 +289,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, args: &A
                             if let Some(sid) = app.current_session_id.clone() {
                                 core.persist_turn(&sid, &mut persisted_count, &messages, usage);
                                 app.token_count = core.session_tokens(&sid) as usize;
+                                app.verify_badge = Some(core.verification_counts(&sid));
                             }
                         }
                         AgentUpdate::Error(e) => {
@@ -355,6 +356,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, args: &A
                             app.current_session_id = Some(id.clone());
                             core.bind_session(&id);
                             persisted_count = 0;
+                            app.verify_badge = None;
                         }
                     }
 
@@ -440,6 +442,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, args: &A
                             core.bind_session(&id);
                             persisted_count = persisted.len();
                             app.token_count = core.session_tokens(&id) as usize;
+                            app.verify_badge = Some(core.verification_counts(&id));
                             app.add_system(format!(
                                 "Resumed session {}",
                                 &id[..8.min(id.len())]
@@ -461,6 +464,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, args: &A
                             messages.clear();
                             app.clear_transcript();
                             app.token_count = 0;
+                            app.verify_badge = None;
                             app.chat_picker.notice = Some(format!(
                                 "Started {} chat {}",
                                 mode.label().to_lowercase(),
