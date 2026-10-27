@@ -1,9 +1,9 @@
 //! openklawc-llm — multi-provider LLM abstraction with streaming.
 //!
 //! Supports:
-//!   - OpenAI-compatible APIs (OpenAI, Groq, etc.)
+//!   - OpenAI-compatible APIs (OpenAI, Groq, Z.AI, llama-server, etc.)
 //!   - Anthropic Claude
-//!   - Ollama (local)
+//!   - Local llama.cpp via its OpenAI-compatible endpoint
 
 pub mod native_tools;
 pub mod provider;
@@ -17,8 +17,18 @@ use okc_config::Config;
 use okc_core::{ChatMessage, LlmProvider, ModelCapabilities, ModelRef, StreamTx};
 
 pub use provider::anthropic::AnthropicProvider;
-pub use provider::ollama::OllamaProvider;
 pub use provider::openai::OpenAiProvider;
+
+/// Build an OpenAI-compatible provider from config, honouring the optional
+/// `native_tools` override (endpoints that accept `tools` but never emit
+/// calls — llama-server without `--jinja` — set it to false).
+fn openai_provider_from_config(prov_cfg: &okc_config::ProviderConfig) -> OpenAiProvider {
+    let mut provider = OpenAiProvider::new(&prov_cfg.base_url, &prov_cfg.api_key);
+    if let Some(enabled) = prov_cfg.native_tools {
+        provider = provider.with_native_tools(enabled);
+    }
+    provider
+}
 
 /// Registry of all configured LLM providers and their models.
 pub struct ProviderRegistry {
@@ -38,7 +48,7 @@ impl ProviderRegistry {
         Self {
             providers: HashMap::new(),
             models: Vec::new(),
-            default_model: "ollama/qwen3".to_string(),
+            default_model: String::new(),
         }
     }
 
@@ -47,26 +57,23 @@ impl ProviderRegistry {
         registry.default_model = cfg.model.clone();
 
         for (name, prov_cfg) in &cfg.provider {
-            let provider: Arc<dyn LlmProvider> = match prov_cfg.api.as_deref().map(|a| a.to_lowercase()) {
+            let provider: Arc<dyn LlmProvider> = match prov_cfg
+                .api
+                .as_deref()
+                .map(|a| a.to_lowercase())
+            {
                 Some(ref api) if api == "anthropic" => {
                     Arc::new(AnthropicProvider::new(&prov_cfg.base_url, &prov_cfg.api_key))
                 }
-                Some(ref api) if api == "ollama" => {
-                    Arc::new(OllamaProvider::new(&prov_cfg.base_url))
-                }
                 Some(ref api) if api == "openai" || api == "openai-compatible" => {
-                    Arc::new(OpenAiProvider::new(&prov_cfg.base_url, &prov_cfg.api_key))
+                    Arc::new(openai_provider_from_config(prov_cfg))
                 }
                 // No explicit API type: infer it from the base URL.
                 _ => {
                     if prov_cfg.base_url.contains("anthropic") {
                         Arc::new(AnthropicProvider::new(&prov_cfg.base_url, &prov_cfg.api_key))
-                    } else if prov_cfg.base_url.contains("ollama")
-                        || prov_cfg.base_url.contains(":11434")
-                    {
-                        Arc::new(OllamaProvider::new(&prov_cfg.base_url))
                     } else {
-                        Arc::new(OpenAiProvider::new(&prov_cfg.base_url, &prov_cfg.api_key))
+                        Arc::new(openai_provider_from_config(prov_cfg))
                     }
                 }
             };
@@ -85,18 +92,9 @@ impl ProviderRegistry {
             }
         }
 
-        // If no providers configured, add a default Ollama
-        if registry.providers.is_empty() {
-            let ollama = Arc::new(OllamaProvider::new("http://localhost:11434"));
-            registry.providers.insert("ollama".into(), ollama);
-            registry.models.push(ModelRef {
-                provider: "ollama".into(),
-                model_id: "qwen3".into(),
-                display_name: "ollama/qwen3".into(),
-                capabilities: detect_capabilities("qwen3"),
-            });
-        }
-
+        // No providers configured → an empty registry. `okc_app::boot`
+        // turns that into a clear error instead of silently guessing an
+        // endpoint.
         registry
     }
 

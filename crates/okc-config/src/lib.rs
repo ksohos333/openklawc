@@ -84,7 +84,8 @@ impl ModelPricing {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
-    /// Which wire format to speak: `anthropic`, `openai` or `ollama`.
+    /// Which wire format to speak: `anthropic` or `openai` (any
+    /// OpenAI-compatible endpoint, including llama.cpp's llama-server).
     /// When omitted, the format is inferred from `base_url`.
     #[serde(default)]
     pub api: Option<String>,
@@ -94,6 +95,12 @@ pub struct ProviderConfig {
     pub models: Vec<String>,
     #[serde(default)]
     pub default_model: Option<String>,
+    /// Override the provider's native tool-calling capability. Some
+    /// OpenAI-compatible endpoints accept the `tools` field but never emit
+    /// tool calls (llama-server without `--jinja`); `false` forces the
+    /// text-JSON fallback.
+    #[serde(default)]
+    pub native_tools: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -418,6 +425,7 @@ impl Default for Config {
                 api_key: "{env:MINIMAX_API_KEY}".to_string(),
                 models: vec!["MiniMax-M3".to_string()],
                 default_model: Some("MiniMax-M3".to_string()),
+                native_tools: None,
             },
         );
 

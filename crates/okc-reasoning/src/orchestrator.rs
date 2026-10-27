@@ -45,26 +45,9 @@ enum ConfirmOutcome {
     Unavailable,
 }
 
-/// How the model is allowed to use tools.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolChoice {
-    /// Model decides whether to call tools.
-    Auto,
-    /// Model must call at least one tool.
-    Required,
-    /// Model must not call tools (text-only).
-    None,
-}
-
-impl ToolChoice {
-    pub fn parse(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "required" => ToolChoice::Required,
-            "none" => ToolChoice::None,
-            _ => ToolChoice::Auto,
-        }
-    }
-}
+/// How the model is allowed to use tools. Shared type from `okc_core` so
+/// providers and config speak the same enum.
+pub use okc_core::ToolChoice;
 
 /// Configuration for the orchestrator's behavior.
 #[derive(Debug, Clone)]
@@ -323,7 +306,12 @@ impl Orchestrator {
             let output = if self.provider.supports_native_tools() && !tool_defs.is_empty() {
                 match self
                     .provider
-                    .chat_with_tools(&self.model_id, messages.clone(), tool_defs.clone())
+                    .chat_with_tools(
+                        &self.model_id,
+                        messages.clone(),
+                        tool_defs.clone(),
+                        self.config.tool_choice,
+                    )
                     .await
                 {
                     Ok(out) => out,
@@ -362,7 +350,7 @@ impl Orchestrator {
                 let filtered = okc_core::util::filter_filler_phrases(&text);
                 // The response text is emitted once, below, from the cleaned
                 // output. Emitting it here as well showed text-fallback
-                // (Ollama / llama.cpp) users the reply twice — the first
+                // users (llama.cpp and friends) the reply twice — the first
                 // copy still containing the raw tool JSON.
                 okc_core::parse_tool_calls_native(&filtered)
             };

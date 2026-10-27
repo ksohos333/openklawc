@@ -1,22 +1,25 @@
 //! mcp-vision — Rust MCP server for local image understanding and audio
 //! transcription.
 //!
-//! A Rust port of `vision-mcp-server.py`. All processing stays local or on the
-//! LAN — no cloud, no telemetry.
+//! A Rust port of `vision-mcp-server.py`. All processing stays local — no
+//! cloud, no telemetry. Vision runs against the local llama.cpp server
+//! (llama-server, OpenAI-compatible); transcription runs locally with
+//! whisper.cpp / transcribe.cpp.
 //!
 //! Tools:
-//!   vision_analyze(image_path, question=…, backend="local"|"macstudio")
+//!   vision_analyze(image_path, question=…)
 //!   audio_transcribe(audio_path, model_size=…, language=…)
 //!
 //! Environment:
-//!   VISION_LOCAL_URL          default http://localhost:11434
-//!   VISION_MACSTUDIO_URL      default http://100.92.174.127:11434
-//!   VISION_LOCAL_MODEL        default qwen2.5vl:3b
-//!   VISION_MACSTUDIO_MODEL    default huihui-qwen3-vl-235b-abliterated:latest
+//!   VISION_LOCAL_URL          default http://127.0.0.1:8080 (llama-server)
+//!   VISION_LOCAL_MODEL        default "" — llama-server uses the loaded model
 //!   VISION_MCP_WHISPER_MODEL  default small
 //!   OPENCLAWC_STT_MODEL       path to a GGUF model file (overrides the download)
 //!   OPENCLAWC_STT_BACKEND     handy (default) | server | cli
-//!   WHISPER_SERVER_URL        default http://127.0.0.1:8080
+//!   WHISPER_SERVER_URL        default http://127.0.0.1:8081 (8080 is llama-server)
+//!
+//! Vision needs a multimodal model + mmproj served by llama-server; a
+//! text-only model returns an error, which is reported as-is.
 
 mod stt;
 
@@ -32,7 +35,7 @@ use serde_json::{json, Value};
 const DEFAULT_QUESTION: &str =
     "Describe this image in detail. Note any composition, framing, text legibility or visual-quality issues.";
 
-/// A vision-language backend.
+/// The local vision backend (llama-server, OpenAI-compatible).
 struct Backend {
     name: &'static str,
     url: String,
@@ -44,59 +47,60 @@ fn local_backend() -> Backend {
     Backend {
         name: "local",
         url: std::env::var("VISION_LOCAL_URL")
-            .unwrap_or_else(|_| "http://localhost:11434".to_string())
+            .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
             .trim_end_matches('/')
             .to_string(),
-        model: std::env::var("VISION_LOCAL_MODEL").unwrap_or_else(|_| "qwen2.5vl:3b".to_string()),
+        // Empty means "whatever model llama-server has loaded".
+        model: std::env::var("VISION_LOCAL_MODEL").unwrap_or_default(),
         timeout: Duration::from_secs(600),
     }
 }
 
-fn macstudio_backend() -> Backend {
-    Backend {
-        name: "macstudio",
-        url: std::env::var("VISION_MACSTUDIO_URL")
-            .unwrap_or_else(|_| "http://100.92.174.127:11434".to_string())
-            .trim_end_matches('/')
-            .to_string(),
-        model: std::env::var("VISION_MACSTUDIO_MODEL")
-            .unwrap_or_else(|_| "huihui-qwen3-vl-235b-abliterated:latest".to_string()),
-        timeout: Duration::from_secs(1800),
+/// Sniff the image MIME type from the extension (default png).
+fn mime_for(path: &str) -> &'static str {
+    let lower = path.to_lowercase();
+    if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if lower.ends_with(".webp") {
+        "image/webp"
+    } else if lower.ends_with(".gif") {
+        "image/gif"
+    } else {
+        "image/png"
     }
 }
 
-/// Analyze an image with a vision-language model.
-async fn vision_analyze(
-    client: &Client,
-    image_path: &str,
-    question: &str,
-    backend_name: &str,
-) -> Result<String> {
+/// Build the OpenAI-compatible chat payload with an image part.
+fn build_vision_payload(model: &str, question: &str, mime: &str, encoded: &str) -> Value {
+    json!({
+        "model": model,
+        "stream": false,
+        "temperature": 0.2,
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": question },
+                { "type": "image_url", "image_url": { "url": format!("data:{};base64,{}", mime, encoded) } }
+            ],
+        }],
+    })
+}
+
+/// Analyze an image with the local vision-language model (llama-server).
+async fn vision_analyze(client: &Client, image_path: &str, question: &str) -> Result<String> {
     let path = expand_home(image_path);
     if !Path::new(&path).exists() {
         return Ok(format!("ERROR: image not found: {}", path));
     }
 
-    let backend = match backend_name {
-        "macstudio" => macstudio_backend(),
-        _ => local_backend(),
-    };
+    let backend = local_backend();
 
     let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path))?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
-    let payload = json!({
-        "model": backend.model,
-        "stream": false,
-        "options": { "temperature": 0.2 },
-        "messages": [{
-            "role": "user",
-            "content": question,
-            "images": [encoded],
-        }],
-    });
+    let payload = build_vision_payload(&backend.model, question, mime_for(&path), &encoded);
 
-    let url = format!("{}/api/chat", backend.url);
+    let url = format!("{}/v1/chat/completions", backend.url);
     let response = client
         .post(&url)
         .json(&payload)
@@ -108,28 +112,30 @@ async fn vision_analyze(
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("Ollama error: {}\n{}", status.as_u16(), body);
+        anyhow::bail!("vision backend error: {}\n{}", status.as_u16(), body);
     }
 
     let data = response
         .json::<Value>()
         .await
-        .context("parsing Ollama response")?;
+        .context("parsing vision backend response")?;
     let message = data
-        .get("message")
-        .and_then(|m| m.get("content"))
+        .pointer("/choices/0/message/content")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .trim()
         .to_string();
-    let eval_count = data
-        .get("eval_count")
+    let tokens = data
+        .pointer("/usage/completion_tokens")
         .map(|v| v.to_string())
         .unwrap_or_else(|| "?".to_string());
 
     Ok(format!(
         "[backend={} model={} tokens={}]\n{}",
-        backend.name, backend.model, eval_count, message
+        backend.name,
+        if backend.model.is_empty() { "(loaded)" } else { &backend.model },
+        tokens,
+        message
     ))
 }
 
@@ -213,7 +219,7 @@ async fn audio_transcribe_server(
     language: &str,
 ) -> Result<String> {
     let server_url = std::env::var("WHISPER_SERVER_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
+        .unwrap_or_else(|_| "http://127.0.0.1:8081".to_string())
         .trim_end_matches('/')
         .to_string();
 
@@ -452,15 +458,14 @@ async fn main() -> Result<()> {
     let analyze_client = client.clone();
     server.add_tool(
         "vision_analyze",
-        "Analyze an image with a local vision-language model. backend=\"local\" is fast \
-         (seconds); backend=\"macstudio\" uses a much stronger model over the LAN but is \
-         slow — reserve it for final review.",
+        "Analyze an image with the local vision-language model (llama-server). \
+         Needs a multimodal model + mmproj loaded; a text-only model reports \
+         an error.",
         json!({
             "type": "object",
             "properties": {
                 "image_path": { "type": "string" },
-                "question": { "type": "string", "default": DEFAULT_QUESTION },
-                "backend": { "type": "string", "enum": ["local", "macstudio"], "default": "local" }
+                "question": { "type": "string", "default": DEFAULT_QUESTION }
             },
             "required": ["image_path"]
         }),
@@ -474,9 +479,8 @@ async fn main() -> Result<()> {
                     .as_str()
                     .filter(|q| !q.is_empty())
                     .unwrap_or(DEFAULT_QUESTION);
-                let backend = args["backend"].as_str().unwrap_or("local");
                 Ok(json!(
-                    vision_analyze(&client, image_path, question, backend).await?
+                    vision_analyze(&client, image_path, question).await?
                 ))
             })
         }),
@@ -517,6 +521,31 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vision_payload_uses_openai_wire_format() {
+        let payload = build_vision_payload("", "what is this?", "image/png", "QUJD");
+        let parts = payload
+            .pointer("/messages/0/content")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "what is this?");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(
+            parts[1]["image_url"]["url"],
+            "data:image/png;base64,QUJD"
+        );
+        assert_eq!(payload["stream"], false);
+    }
+
+    #[test]
+    fn mime_is_sniffed_from_extension() {
+        assert_eq!(mime_for("/tmp/a.png"), "image/png");
+        assert_eq!(mime_for("/tmp/a.JPG"), "image/jpeg");
+        assert_eq!(mime_for("/tmp/a.webp"), "image/webp");
+        assert_eq!(mime_for("/tmp/noext"), "image/png");
+    }
 
     #[test]
     fn transcript_format_matches_upstream() {

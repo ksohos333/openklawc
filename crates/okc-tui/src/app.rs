@@ -127,7 +127,7 @@ impl App {
             theme: Theme::gold(),
             reasoning_steps: VecDeque::new(),
             show_reasoning: true,
-            model: "ollama/qwen3".to_string(),
+            model: String::new(),
             autonomy: AutonomyLevel::ReadOnly,
             mcp_count: 0,
             input_history: VecDeque::with_capacity(100),

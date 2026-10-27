@@ -47,12 +47,15 @@ A roadmap to evolve OpenKLawc from its current v0.2 foundation into a robust, po
 ### Deliverables
 - [x] **Parallel tool execution** — independent tool calls run concurrently via `join_all`
 - [x] **Retry with exponential backoff** — transient failures auto-retry up to `N` times with 2^n delay
-- [x] **Tool choice strategies** — `auto` | `required` | `none` (config-driven)
+- [x] **Tool choice strategies** — `auto` | `required` | `none` (config-driven, now actually sent to the provider)
 - [x] **Tool result summarization** — long outputs (>4k chars) summarized by LLM before feedback
-- [ ] **Configuration-driven behavior** — runtime honors defaults, but file values never arrive: `Agent::with_config` has no callers, so `[orchestrator]` in config is parsed then ignored. Fixed in the okc-app extraction (P1).
+- [x] **Configuration-driven behavior** — all execution parameters in `config.toml`
   - `tool_choice`, `max_iterations`, `parallel_tools`
   - `retry_count`, `retry_delay_ms`
   - `summarize_results`, `summarize_threshold`
+  - `call_timeout_ms` (hard per-call tool timeout)
+- [x] **Native function calling** — provider-native `tool_use` / `tools` for Anthropic and OpenAI-compatible providers, with a text-JSON fallback for models that lack it (`native_tools = false` per provider)
+- [x] **Local inference via llama.cpp** — `llama-server` (OpenAI-compatible) replaces Ollama; OllamaProvider removed
 - [ ] **Extended thinking / chain-of-thought** — native provider support for reasoning tokens (Anthropic, OpenAI o1)
 - [ ] **Streaming reasoning visualization** — live reasoning tokens in the TUI
 - [ ] **Computer Use patterns** — screenshot + action loop for GUI automation

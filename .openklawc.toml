@@ -11,10 +11,15 @@ base_url = "https://api.minimax.io/anthropic/v1"
 api_key = "{file:~/.config/opencode/keys/minimax-sub.key}"
 models = ["MiniMax-M3", "MiniMax-M2.7"]
 
-[provider.ollama]
-base_url = "http://localhost:11434/v1"
+# Local inference — llama.cpp (llama-server, OpenAI-compatible endpoint).
+# native_tools stays false until llama-server runs with `--jinja` and a
+# tool-capable chat template; until then the text-JSON fallback is used.
+[provider.llamacpp]
+api = "openai"
+base_url = "http://127.0.0.1:8080/v1"
 api_key = ""
-models = ["qwen3"]
+native_tools = false
+models = ["gemma-4-12b-abliterated"]
 
 # Z.AI GLM coding plan (OpenAI-compatible). The key stays in the shared
 # key file — this project config is tracked in git.

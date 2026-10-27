@@ -529,6 +529,30 @@ pub struct NativeToolResult {
     pub is_error: bool,
 }
 
+/// How the model should choose tools for a turn. `None` means "do not
+/// offer tools at all".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ToolChoice {
+    /// The model decides freely.
+    #[default]
+    Auto,
+    /// The model must use at least one tool.
+    Required,
+    /// Tools are not offered for this turn.
+    None,
+}
+
+impl ToolChoice {
+    /// Parse a config string; unknown values degrade to `Auto`.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "required" => Self::Required,
+            "none" => Self::None,
+            _ => Self::Auto,
+        }
+    }
+}
+
 /// Token accounting reported by an LLM provider.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
@@ -640,16 +664,20 @@ pub trait LlmProvider: Send + Sync {
     }
 
     /// Chat with native tool support. Returns TurnOutput (text + tool_calls).
-    /// Default implementation falls back to text injection + text parsing.
+    /// Default implementation falls back to text injection + text parsing;
+    /// with [`ToolChoice::None`] the tools are not even offered.
     async fn chat_with_tools(
         &self,
         model: &str,
         messages: Vec<ChatMessage>,
         tools: Vec<NativeToolDef>,
+        choice: ToolChoice,
     ) -> anyhow::Result<TurnOutput> {
         let mut msgs = messages;
-        if let Some(sys) = msgs.iter_mut().find(|m| m.role == Role::System) {
-            sys.content = inject_tools_into_prompt(&sys.content, &tools);
+        if choice != ToolChoice::None {
+            if let Some(sys) = msgs.iter_mut().find(|m| m.role == Role::System) {
+                sys.content = inject_tools_into_prompt(&sys.content, &tools);
+            }
         }
         let text = self.chat(model, msgs).await?;
         Ok(parse_tool_calls_native(&text))
@@ -662,11 +690,14 @@ pub trait LlmProvider: Send + Sync {
         model: &str,
         messages: Vec<ChatMessage>,
         tools: Vec<NativeToolDef>,
+        choice: ToolChoice,
         tx: StreamTx,
     ) -> anyhow::Result<TurnOutput> {
         let mut msgs = messages;
-        if let Some(sys) = msgs.iter_mut().find(|m| m.role == Role::System) {
-            sys.content = inject_tools_into_prompt(&sys.content, &tools);
+        if choice != ToolChoice::None {
+            if let Some(sys) = msgs.iter_mut().find(|m| m.role == Role::System) {
+                sys.content = inject_tools_into_prompt(&sys.content, &tools);
+            }
         }
         self.chat_stream(model, msgs, tx).await?;
         // Streaming doesn't return TurnOutput directly; caller must re-parse.

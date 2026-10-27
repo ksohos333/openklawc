@@ -131,6 +131,9 @@ async fn run_headless(args: &Args, prompt: String) -> Result<()> {
         eprintln!("[mcp] failed to start: {}", failure);
     }
     eprintln!("[mcp] {} tools registered", boot.mcp_tools);
+    for warning in &boot.provider_warnings {
+        eprintln!("[warn] {}", warning);
+    }
     eprintln!("[model] {}", boot.model);
 
     // Headless runs never attach an approval channel, so any tool call that
@@ -218,6 +221,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, args: &A
     app.theme = Theme::from_name(&core.cfg.ui.theme);
     for failure in &boot.mcp_failures {
         app.add_system(format!("[mcp] failed to start: {}", failure));
+    }
+    for warning in &boot.provider_warnings {
+        app.add_system(format!("[warn] {}", warning));
     }
 
     let mut messages: Vec<ChatMessage> = Vec::new();

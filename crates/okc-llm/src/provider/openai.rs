@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use okc_core::{
-    ChatMessage, LlmProvider, NativeToolDef, StreamTx, TokenUsage, TurnOutput, UsageSlot,
+    ChatMessage, LlmProvider, NativeToolDef, StreamTx, TokenUsage, ToolChoice, TurnOutput,
+    UsageSlot,
 };
 
 use crate::native_tools::{parse_openai_message, to_openai_tools};
@@ -15,6 +16,7 @@ pub struct OpenAiProvider {
     client: reqwest::Client,
     base_url: String,
     api_key: String,
+    native_tools: bool,
     usage: UsageSlot,
 }
 
@@ -24,8 +26,18 @@ impl OpenAiProvider {
             client: reqwest::Client::new(),
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
+            native_tools: true,
             usage: UsageSlot::default(),
         }
+    }
+
+    /// Override the native-tools capability. Some OpenAI-compatible
+    /// endpoints (llama-server without `--jinja`, older gateways) accept
+    /// the `tools` field but never emit tool calls; `false` forces the
+    /// text-JSON fallback instead.
+    pub fn with_native_tools(mut self, enabled: bool) -> Self {
+        self.native_tools = enabled;
+        self
     }
 }
 
@@ -40,7 +52,7 @@ impl LlmProvider for OpenAiProvider {
     }
 
     fn supports_native_tools(&self) -> bool {
-        true
+        self.native_tools
     }
 
     fn last_usage(&self) -> Option<TokenUsage> {
@@ -53,6 +65,7 @@ impl LlmProvider for OpenAiProvider {
             messages: to_openai_messages(messages),
             stream: false,
             tools: None,
+            tool_choice: None,
         };
         let url = format!("{}/chat/completions", self.base_url);
         let resp = self
@@ -97,6 +110,7 @@ impl LlmProvider for OpenAiProvider {
             messages: to_openai_messages(messages),
             stream: true,
             tools: None,
+            tool_choice: None,
         };
         self.do_stream(req, tx).await
     }
@@ -108,12 +122,15 @@ impl LlmProvider for OpenAiProvider {
         model: &str,
         messages: Vec<ChatMessage>,
         tools: Vec<NativeToolDef>,
+        choice: ToolChoice,
     ) -> Result<TurnOutput> {
+        let (tools_field, choice_field) = openai_tool_fields(&tools, choice);
         let req = OpenAiRequest {
             model: model.to_string(),
             messages: to_openai_messages(messages),
             stream: false,
-            tools: Some(to_openai_tools(&tools)),
+            tools: tools_field,
+            tool_choice: choice_field,
         };
         let url = format!("{}/chat/completions", self.base_url);
         let resp = self
@@ -153,13 +170,16 @@ impl LlmProvider for OpenAiProvider {
         model: &str,
         messages: Vec<ChatMessage>,
         tools: Vec<NativeToolDef>,
+        choice: ToolChoice,
         tx: StreamTx,
     ) -> Result<TurnOutput> {
+        let (tools_field, choice_field) = openai_tool_fields(&tools, choice);
         let req = OpenAiRequest {
             model: model.to_string(),
             messages: to_openai_messages(messages),
             stream: true,
-            tools: Some(to_openai_tools(&tools)),
+            tools: tools_field,
+            tool_choice: choice_field,
         };
         // Streaming with tools: we need to accumulate the full response to parse tool_calls.
         // OpenAI streams partial tool_calls. For now, we collect and parse at the end.
@@ -234,6 +254,27 @@ struct OpenAiRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<Value>,
+}
+
+/// Build the `tools` / `tool_choice` request fields for a turn.
+/// `ToolChoice::None` offers no tools at all.
+fn openai_tool_fields(
+    tools: &[NativeToolDef],
+    choice: ToolChoice,
+) -> (Option<Value>, Option<Value>) {
+    match choice {
+        ToolChoice::None => (None, None),
+        ToolChoice::Auto => (
+            Some(to_openai_tools(tools)),
+            Some(Value::String("auto".into())),
+        ),
+        ToolChoice::Required => (
+            Some(to_openai_tools(tools)),
+            Some(Value::String("required".into())),
+        ),
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -294,7 +335,9 @@ fn to_openai_messages(messages: Vec<ChatMessage>) -> Vec<OpenAiMessage> {
             role: msg.role.to_string(),
             content: Some(msg.content).filter(|s| !s.is_empty()),
             tool_calls,
-            tool_call_id: msg.name,
+            // tool_call_id belongs only on role:"tool" messages (set above);
+            // a legacy `name` on other roles must not leak into it.
+            tool_call_id: None,
         });
     }
 
@@ -332,3 +375,34 @@ struct OpenAiStreamChoice {
 }
 
 use futures::StreamExt;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool() -> NativeToolDef {
+        NativeToolDef {
+            name: "read_file".to_string(),
+            description: "read a file".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    #[test]
+    fn tool_choice_none_offers_no_tools() {
+        let (tools, choice) = openai_tool_fields(&[tool()], ToolChoice::None);
+        assert!(tools.is_none(), "no tools may be advertised");
+        assert!(choice.is_none());
+    }
+
+    #[test]
+    fn tool_choice_auto_and_required_map_to_openai() {
+        let (tools, choice) = openai_tool_fields(&[tool()], ToolChoice::Auto);
+        assert!(tools.is_some());
+        assert_eq!(choice, Some(Value::String("auto".into())));
+
+        let (tools, choice) = openai_tool_fields(&[tool()], ToolChoice::Required);
+        assert!(tools.is_some());
+        assert_eq!(choice, Some(Value::String("required".into())));
+    }
+}

@@ -12,7 +12,7 @@ crates/
 ├── okc-llm/            # Multi-provider LLM with streaming
 │   ├── OpenAI-compatible (OpenAI, Groq, Z.AI, Kimi, DevPass, Chutes...)
 │   ├── Anthropic Claude
-│   └── Ollama (local)
+│   └── llama.cpp (local, OpenAI-compatible)
 ├── okc-mcp/            # MCP client + server framework (stdio + SSE) + bundled catalogue
 ├── okc-tool/           # Built-in tools: shell, file, git, search
 ├── okc-reasoning/      # Autonomy engine — agent loop with tool call parsing
@@ -80,9 +80,9 @@ Server-specific environment variables:
 | `LOCAL_BRAIN_URL` | local-brain | `http://127.0.0.1:9876` |
 | `LAYA_BASE_URL` | laya | `http://127.0.0.1:11435` |
 | `LAYA_API_KEY` | laya | unset |
-| `VISION_LOCAL_URL` | vision | `http://localhost:11434` |
-| `VISION_MACSTUDIO_URL` | vision | `http://100.92.174.127:11434` |
-| `WHISPER_SERVER_URL` | vision (audio) | `http://127.0.0.1:8080` |
+| `VISION_LOCAL_URL` | vision | `http://127.0.0.1:8080` (llama-server) |
+| `VISION_LOCAL_MODEL` | vision | empty — llama-server uses the loaded model |
+| `WHISPER_SERVER_URL` | vision (audio) | `http://127.0.0.1:8081` |
 | `OPENCLAWC_FS_DIRS` | filesystem | the working directory |
 
 ### Configured — start when listed in the config
@@ -109,12 +109,17 @@ Config merges in order of priority:
 4. Built-in defaults
 
 ```toml
-model = "ollama/qwen3"
+model = "llamacpp/gemma-4-12b-abliterated"
 
-[provider.ollama]
-base_url = "http://localhost:11434/v1"
+# Local inference — llama.cpp's llama-server (OpenAI-compatible).
+# native_tools = false until the server runs with `--jinja` and a
+# tool-capable chat template; until then the text-JSON fallback is used.
+[provider.llamacpp]
+api = "openai"
+base_url = "http://127.0.0.1:8080/v1"
 api_key = ""
-models = ["qwen3"]
+native_tools = false
+models = ["gemma-4-12b-abliterated"]
 
 # Rust-native MCP servers (paths are absolute)
 [mcp.web_research]
@@ -149,7 +154,7 @@ The `okc-llm` crate supports any OpenAI-compatible API:
 |----------|------------------|---------|
 | OpenAI | `https://api.openai.com/v1` | Native function calling |
 | Anthropic | `https://api.anthropic.com/v1` | Claude Messages API |
-| Ollama | `http://localhost:11434` | Local inference |
+| llama.cpp | `http://127.0.0.1:8080/v1` | Local inference (llama-server) |
 | Z.AI | `https://api.z.ai/api/coding/paas/v4` | GLM models |
 | MiniMax | `https://api.minimax.io/anthropic/v1` | M Plan Go |
 | Kimi | `https://api.moonshot.ai/v1` | Moonshot |
@@ -157,6 +162,32 @@ The `okc-llm` crate supports any OpenAI-compatible API:
 | Chutes | `https://llm.chutes.ai/v1` | TEE inference |
 | Venice | `https://api.venice.ai/v1` | Uncensored |
 | Groq | `https://api.groq.com/openai/v1` | Fast inference |
+
+### Local inference with llama.cpp
+
+openklawc talks to **llama.cpp's `llama-server`**, which speaks the
+OpenAI-compatible API — no Ollama anywhere:
+
+```bash
+~/llama.cpp/build/bin/llama-server --host 127.0.0.1 --port 8080 \
+  --model ~/path/to/model.gguf --alias my-model --ctx-size 16384
+```
+
+```toml
+[provider.llamacpp]
+api = "openai"
+base_url = "http://127.0.0.1:8080/v1"
+api_key = ""
+models = ["my-model"]
+# Native tool calling needs `--jinja` and a tool-capable chat template.
+# Without it, set native_tools = false and the text-JSON fallback is used.
+native_tools = false
+```
+
+At boot openklawc pings `http://127.0.0.1:8080/v1/health` and tells you
+if the local server is not answering. Vision (`vision_analyze`) uses the
+same server and needs a multimodal model + `mmproj` loaded; transcription
+uses whisper.cpp / transcribe.cpp locally.
 
 ## Autonomy Levels
 
@@ -371,7 +402,8 @@ Attach files to your query with `@`:
 - [x] Built-in tools (file, shell, git, search)
 - [x] MCP client (stdio + SSE)
 - [x] **Rust-native MCP servers** (web_research, anticonf, legal_research)
-- [ ] Native function calling (OpenAI/Anthropic tool_use)
+- [x] Native function calling (OpenAI/Anthropic tool_use) with `tool_choice`
+- [x] Local inference via llama.cpp (llama-server, OpenAI-compatible)
 - [ ] File mutation diffing and review
 - [ ] Confirmation modal for ask/read_only modes
 - [ ] CodeMode equivalent — sandboxed script execution

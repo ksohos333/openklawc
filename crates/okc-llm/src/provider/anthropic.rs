@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use okc_core::{
     ChatMessage, LlmProvider, NativeToolDef, NativeToolResult, Role, StreamTx, TokenUsage,
-    TurnOutput, UsageSlot,
+    ToolChoice, TurnOutput, UsageSlot,
 };
 
 use crate::native_tools::{parse_anthropic_content, to_anthropic_tool_results, to_anthropic_tools};
@@ -68,6 +68,7 @@ impl LlmProvider for AnthropicProvider {
             messages: user_messages,
             stream: false,
             tools: None,
+            tool_choice: None,
         };
         let url = format!("{}/messages", self.base_url);
         let resp = self
@@ -116,6 +117,7 @@ impl LlmProvider for AnthropicProvider {
             messages: user_messages,
             stream: true,
             tools: None,
+            tool_choice: None,
         };
         self.do_stream(req, tx).await
     }
@@ -127,6 +129,7 @@ impl LlmProvider for AnthropicProvider {
         model: &str,
         messages: Vec<ChatMessage>,
         tools: Vec<NativeToolDef>,
+        choice: ToolChoice,
     ) -> Result<TurnOutput> {
         let (system, user_messages) = extract_system(messages);
         let req = AnthropicRequest {
@@ -135,7 +138,8 @@ impl LlmProvider for AnthropicProvider {
             system,
             messages: user_messages,
             stream: false,
-            tools: Some(to_anthropic_tools(&tools)),
+            tools: anthropic_tools_field(&tools, choice),
+            tool_choice: anthropic_tool_choice_field(choice),
         };
         let url = format!("{}/messages", self.base_url);
         let resp = self
@@ -166,11 +170,12 @@ impl LlmProvider for AnthropicProvider {
         model: &str,
         messages: Vec<ChatMessage>,
         tools: Vec<NativeToolDef>,
+        choice: ToolChoice,
         tx: StreamTx,
     ) -> Result<TurnOutput> {
         // Anthropic tool streaming is complex (content_block events).
         // For now, fall back to non-streaming for tool calls.
-        let result = self.chat_with_tools(model, messages, tools).await?;
+        let result = self.chat_with_tools(model, messages, tools, choice).await?;
         // Still send text chunks to the UI
         let _ = tx.send(result.text.clone()).await;
         Ok(result)
@@ -285,6 +290,27 @@ struct AnthropicRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<Value>,
+}
+
+/// The `tools` field: the tool list, or None when tools are not offered
+/// this turn (`ToolChoice::None`).
+fn anthropic_tools_field(tools: &[NativeToolDef], choice: ToolChoice) -> Option<Value> {
+    if choice == ToolChoice::None {
+        None
+    } else {
+        Some(to_anthropic_tools(tools))
+    }
+}
+
+/// The `tool_choice` field in Anthropic's shape: auto | any.
+fn anthropic_tool_choice_field(choice: ToolChoice) -> Option<Value> {
+    match choice {
+        ToolChoice::Auto => Some(serde_json::json!({"type": "auto"})),
+        ToolChoice::Required => Some(serde_json::json!({"type": "any"})),
+        ToolChoice::None => None,
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -340,5 +366,34 @@ pub fn build_anthropic_tool_result_message(results: &[NativeToolResult]) -> Anth
     AnthropicMessage {
         role: "user".to_string(),
         content: serde_json::json!(blocks),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_choice_maps_to_anthropic_shape() {
+        assert_eq!(
+            anthropic_tool_choice_field(ToolChoice::Auto),
+            Some(serde_json::json!({"type": "auto"}))
+        );
+        assert_eq!(
+            anthropic_tool_choice_field(ToolChoice::Required),
+            Some(serde_json::json!({"type": "any"}))
+        );
+        assert_eq!(anthropic_tool_choice_field(ToolChoice::None), None);
+    }
+
+    #[test]
+    fn tool_choice_none_offers_no_tools() {
+        let tools = vec![NativeToolDef {
+            name: "read_file".to_string(),
+            description: "read".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        assert!(anthropic_tools_field(&tools, ToolChoice::None).is_none());
+        assert!(anthropic_tools_field(&tools, ToolChoice::Auto).is_some());
     }
 }

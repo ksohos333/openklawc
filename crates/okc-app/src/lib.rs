@@ -60,6 +60,9 @@ pub struct BootInfo {
     pub mcp_tools: usize,
     /// MCP servers that failed to start (`name: error`), for display.
     pub mcp_failures: Vec<String>,
+    /// Warnings about the resolved provider (e.g. a local server that did
+    /// not answer its health check).
+    pub provider_warnings: Vec<String>,
     /// The resolved qualified model id (`provider/model`).
     pub model: String,
 }
@@ -115,6 +118,36 @@ impl App {
         let (provider, model) = llm_registry
             .get(&model_id)
             .ok_or_else(|| anyhow!("model '{}' disappeared during boot", model_id))?;
+
+        // ─── Local provider health check ─────────────────────────────────
+        // A loopback endpoint that does not answer gets a visible warning
+        // instead of a cryptic per-turn connection error.
+        let mut provider_warnings = Vec::new();
+        if let Some(provider_name) = model_id.split('/').next() {
+            if let Some(pc) = cfg.provider.get(provider_name) {
+                let base = pc.base_url.trim_end_matches('/');
+                if base.contains("127.0.0.1") || base.contains("localhost") {
+                    let health = format!("{}/health", base);
+                    let probe = reqwest::Client::builder()
+                        .timeout(Duration::from_secs(3))
+                        .build()
+                        .map_err(|e| anyhow!("building health client: {}", e))?;
+                    match probe.get(&health).send().await {
+                        Ok(resp) if resp.status().is_success() => {}
+                        Ok(resp) => provider_warnings.push(format!(
+                            "provider '{}' at {} answered {} on /health — is the server up?",
+                            provider_name,
+                            base,
+                            resp.status()
+                        )),
+                        Err(e) => provider_warnings.push(format!(
+                            "provider '{}' at {} is unreachable ({}) — start the server or switch models",
+                            provider_name, base, e
+                        )),
+                    }
+                }
+            }
+        }
 
         // ─── Tools: built-in (filtered by [tools] flags) + custom + MCP ──
         let mut composite = CompositeExecutor::new();
@@ -249,6 +282,7 @@ impl App {
             BootInfo {
                 mcp_tools: mcp_tool_count,
                 mcp_failures,
+                provider_warnings,
                 model: model_id,
             },
         ))
