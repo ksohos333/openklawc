@@ -12,7 +12,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+
+      # mcp-vision links whisper.cpp with the `vulkan` cargo feature enabled,
+      # which needs the Vulkan SDK and glslc to configure. GitHub runners do
+      # not ship it, so that crate is built in the release pipeline instead of
+      # here. Nothing else in the workspace depends on it, so excluding it
+      # leaves the rest of the workspace fully built and tested.
       - name: Build workspace
-        run: cargo build --workspace
+        run: cargo build --workspace --exclude mcp-vision
+
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude mcp-vision
