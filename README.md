@@ -410,6 +410,20 @@ Attach files to your query with `@`:
 - [ ] Plugin loading (WASM)
 - [ ] Web interface
 
+## How I built this
+
+**The problem.** A coding agent that runs commands and edits files is only useful if you can see what it is about to do. The hard part is not the model call — it is the interface discipline around destructive operations.
+
+**Design decisions worth arguing about:**
+
+- **A terminal UI, not a browser.** One process, no browser in the loop, which makes the audit trail complete by construction. A browser-based agent has an unobservable gap between "what it decided" and "what the page did".
+- **Streaming is a first-class concern.** Output arrives token by token while tools run in parallel, so the UI has to stay responsive during a long turn. That pushed the render loop away from a naive "collect everything, then print".
+- **Bundled vs configured MCP servers are different lifecycles.** Bundled servers start automatically with the binary; configured ones only start if listed in config. Collapsing these two into one mechanism would have been simpler and would have made startup slower and less predictable.
+- **Policy engine and audit trail travel with the tool calls**, not with the conversation, so they cannot be skipped by a code path that forgot to include them.
+- **Integration tests over a mock provider.** `boot.rs` runs a full turn against a mock provider with no MCP servers attached, which is how I test the loop without a model in the way.
+
+**What I would change with more time:** the bundled registry is assembled at build time, which makes the binary large and the build slow. A signed, lazily-fetched registry would trade a little startup cost for a much smaller artifact.
+
 ## License
 
 MIT
